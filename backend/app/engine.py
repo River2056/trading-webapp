@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from datetime import datetime
-from decimal import Decimal
+from datetime import UTC, datetime
+from decimal import ROUND_DOWN, Decimal
 from typing import Protocol
 
 from .database import Database
@@ -28,6 +29,8 @@ class RoundPlanningSettings:
     stop_loss_pct: Decimal
     take_profit_pct: Decimal
     daily_loss_limit_pct: Decimal
+    strategy_cadence_seconds: int = 300
+    starting_capital_ntd: Decimal = Decimal("5000")
     minimum_net_return_pct: Decimal = Decimal("0")
     minimum_entry_count: int = 1
     minimum_trade_count: int = 2
@@ -47,6 +50,8 @@ class RoundPlanningSettings:
             stop_loss_pct=Decimal(str(values["stop_loss_pct"])),
             take_profit_pct=Decimal(str(values["take_profit_pct"])),
             daily_loss_limit_pct=Decimal(str(values["daily_loss_limit_pct"])),
+            strategy_cadence_seconds=int(str(values.get("strategy_cadence_seconds", 300))),
+            starting_capital_ntd=Decimal(str(values.get("starting_capital_ntd", "5000"))),
             minimum_net_return_pct=Decimal(str(values.get("minimum_net_return_pct", "0"))),
             minimum_entry_count=int(str(values.get("minimum_entry_count", 1))),
             minimum_trade_count=int(str(values.get("minimum_trade_count", 2))),
@@ -264,12 +269,73 @@ class RoundPlan:
     frozen_settings: RoundPlanningSettings
 
 
+@dataclass(frozen=True)
+class TradingDecision:
+    symbol: str
+    action: str
+    outcome: str
+    reason: str
+    signal_id: str
+
+
+@dataclass(frozen=True)
+class PortfolioAccount:
+    cash_ntd: Decimal
+    position_value_ntd: Decimal
+    realized_pnl_ntd: Decimal
+    unrealized_pnl_ntd: Decimal
+    costs_ntd: Decimal
+    available_capital_ntd: Decimal
+    total_equity_ntd: Decimal
+
+
+@dataclass(frozen=True)
+class EvaluationResult:
+    decisions: tuple[TradingDecision, ...]
+    account: PortfolioAccount
+
+
+@dataclass(frozen=True)
+class _ValidatedPrice:
+    price_ntd: Decimal
+    source_timestamp: datetime
+    evidence: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _PreparedDecision:
+    symbol: str
+    source_timestamp: datetime
+    strategy_version: str
+    action: str
+    reason: str
+    evidence: dict[str, object]
+    price_ntd: Decimal
+
+
 def _json(value: object) -> str:
     return json.dumps(value, default=str, sort_keys=True, separators=(",", ":"))
 
 
 def _decimal_text(value: Decimal) -> str:
     return format(value.normalize(), "f")
+
+
+def _strategy_from_record(version: str, configuration_json: str) -> Strategy:
+    configuration = json.loads(configuration_json)
+    if version == "rsi-v1":
+        return RsiStrategy(
+            period=int(configuration["period"]),
+            entry_below=Decimal(str(configuration["entry_below"])),
+            exit_above=Decimal(str(configuration["exit_above"])),
+        )
+    if version == "macd-v1":
+        return MacdStrategy(
+            fast_period=int(configuration["fast_period"]),
+            slow_period=int(configuration["slow_period"]),
+            signal_period=int(configuration["signal_period"]),
+        )
+    raise RoundPlanningError(f"unsupported strategy version: {version}")
 
 
 class TradingEngine:
@@ -280,6 +346,590 @@ class TradingEngine:
         self.market_data = market_data
         self.clock = clock
         self.last_exclusions: dict[str, str] = {}
+
+    def evaluate_active_round(self) -> EvaluationResult:
+        now = self.clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
+        with self.database.connect() as connection, connection:
+            run_row = connection.execute(
+                "SELECT desired_state FROM trading_run ORDER BY id LIMIT 1"
+            ).fetchone()
+            if run_row is None or str(run_row["desired_state"]) != "running":
+                raise RoundPlanningError("trading run is stopped")
+            round_row = connection.execute(
+                "SELECT id, frozen_settings_json FROM trading_round "
+                "WHERE status='active' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if round_row is None:
+                raise RoundPlanningError("no active round")
+            round_id = int(round_row["id"])
+            settings = json.loads(str(round_row["frozen_settings_json"]))
+            cadence = int(settings.get("strategy_cadence_seconds", 300))
+            interval_number = int(now.timestamp()) // cadence
+            interval_key = f"{cadence}:{interval_number}"
+            prior = connection.execute(
+                "SELECT COUNT(*) FROM trading_signals WHERE round_id=? AND interval_key=?",
+                (round_id, interval_key),
+            ).fetchone()[0]
+            if prior:
+                snapshot = connection.execute(
+                    "SELECT * FROM portfolio_snapshots WHERE round_id=? AND interval_key=?",
+                    (round_id, interval_key),
+                ).fetchone()
+                return EvaluationResult(
+                    (),
+                    PortfolioAccount(
+                        *(
+                            Decimal(str(snapshot[column]))
+                            for column in (
+                                "cash_ntd",
+                                "position_value_ntd",
+                                "realized_pnl_ntd",
+                                "unrealized_pnl_ntd",
+                                "costs_ntd",
+                                "available_capital_ntd",
+                                "total_equity_ntd",
+                            )
+                        )
+                    ),
+                )
+
+            summaries = {item.symbol: item for item in self.market_data.market_summaries()}
+            selections = connection.execute(
+                "SELECT symbol, strategy_version, strategy_config_json FROM round_selections "
+                "WHERE round_id=? ORDER BY selection_rank",
+                (round_id,),
+            ).fetchall()
+            decisions: list[TradingDecision] = []
+            current_prices: dict[str, Decimal] = {}
+            validated_prices: dict[str, _ValidatedPrice] = {}
+            prepared: list[_PreparedDecision] = []
+
+            # Phase one: collect and validate all valuations before any fill can be sized.
+            for selection in selections:
+                symbol = str(selection["symbol"])
+                strategy_version = str(selection["strategy_version"])
+                summary = summaries.get(symbol)
+                if summary is None:
+                    decisions.append(
+                        self._persist_rejection(
+                            connection,
+                            round_id,
+                            symbol,
+                            interval_key,
+                            now,
+                            now,
+                            strategy_version,
+                            "hold",
+                            "market price unavailable",
+                            {
+                                "source_timestamp_available": False,
+                                "source_timestamp_unavailable_reason": "market summary unavailable",
+                            },
+                        )
+                    )
+                    continue
+                try:
+                    conversion = self.market_data.ntd_conversion(summary.quote_asset)
+                except MarketDataError as error:
+                    decisions.append(
+                        self._persist_rejection(
+                            connection,
+                            round_id,
+                            symbol,
+                            interval_key,
+                            now,
+                            summary.observed_at,
+                            strategy_version,
+                            "hold",
+                            str(error),
+                            {
+                                "market_price": _decimal_text(summary.last_price),
+                                "price_observed_at": summary.observed_at.isoformat(),
+                                "quote_asset": summary.quote_asset,
+                                "market_data_error": str(error),
+                            },
+                        )
+                    )
+                    continue
+                price_ntd = summary.last_price * conversion.rate
+                source_timestamp = min(summary.observed_at, conversion.observed_at)
+                evidence: dict[str, object] = {
+                    "market_price": _decimal_text(summary.last_price),
+                    "market_price_ntd": _decimal_text(price_ntd),
+                    "conversion_rate": _decimal_text(conversion.rate),
+                    "conversion_path": conversion.path,
+                    "price_observed_at": summary.observed_at.isoformat(),
+                    "conversion_observed_at": conversion.observed_at.isoformat(),
+                }
+                reason: str | None = None
+                rejected_timestamp = source_timestamp
+                if price_ntd <= 0:
+                    reason = "market price or conversion rate is not positive"
+                elif (now - summary.observed_at).total_seconds() > int(
+                    settings.get("max_candle_age_seconds", 7200)
+                ):
+                    reason = "market price is stale"
+                    rejected_timestamp = summary.observed_at
+                elif (now - conversion.observed_at).total_seconds() > int(
+                    settings.get("max_conversion_age_seconds", 86400)
+                ):
+                    reason = "NTD conversion is stale"
+                    rejected_timestamp = conversion.observed_at
+                if reason is not None:
+                    decisions.append(
+                        self._persist_rejection(
+                            connection,
+                            round_id,
+                            symbol,
+                            interval_key,
+                            now,
+                            rejected_timestamp,
+                            strategy_version,
+                            "hold",
+                            reason,
+                            evidence,
+                        )
+                    )
+                    continue
+                current_prices[symbol] = price_ntd
+                validated_prices[symbol] = _ValidatedPrice(price_ntd, source_timestamp, evidence)
+
+            # Phase two: evaluate signals against the complete validated price map.
+            sizing_account = self._account(connection, round_id, settings, current_prices)
+            for selection in selections:
+                symbol = str(selection["symbol"])
+                validated = validated_prices.get(symbol)
+                if validated is None:
+                    continue
+                strategy_version = str(selection["strategy_version"])
+                price_ntd = validated.price_ntd
+                source_timestamp = validated.source_timestamp
+                evidence = dict(validated.evidence)
+                try:
+                    candles = self.market_data.historical_candles(
+                        symbol,
+                        str(settings["candle_interval"]),
+                        int(settings["backtest_lookback_candles"]),
+                    )
+                except MarketDataError as error:
+                    evidence["market_data_error"] = str(error)
+                    decisions.append(
+                        self._persist_rejection(
+                            connection,
+                            round_id,
+                            symbol,
+                            interval_key,
+                            now,
+                            source_timestamp,
+                            strategy_version,
+                            "hold",
+                            str(error),
+                            evidence,
+                        )
+                    )
+                    continue
+                if not candles:
+                    decisions.append(
+                        self._persist_rejection(
+                            connection,
+                            round_id,
+                            symbol,
+                            interval_key,
+                            now,
+                            source_timestamp,
+                            strategy_version,
+                            "hold",
+                            "signal candles unavailable",
+                            evidence,
+                        )
+                    )
+                    continue
+                candle_timestamp = candles[-1].opened_at
+                if (now - candle_timestamp).total_seconds() > int(
+                    settings.get("max_candle_age_seconds", 7200)
+                ):
+                    decisions.append(
+                        self._persist_rejection(
+                            connection,
+                            round_id,
+                            symbol,
+                            interval_key,
+                            now,
+                            candle_timestamp,
+                            strategy_version,
+                            "hold",
+                            "signal candles are stale",
+                            evidence,
+                        )
+                    )
+                    continue
+                strategy = _strategy_from_record(
+                    strategy_version, str(selection["strategy_config_json"])
+                )
+                raw_signal = strategy.signals(candles)[-1]
+                position = connection.execute(
+                    "SELECT * FROM paper_positions WHERE round_id=? AND symbol=?",
+                    (round_id, symbol),
+                ).fetchone()
+                action = "buy" if raw_signal == 1 else "sell" if raw_signal == -1 else "hold"
+                reason = "strategy entry signal" if action == "buy" else "strategy exit signal"
+                if position is not None:
+                    entry_price = Decimal(str(position["entry_price_ntd"]))
+                    change_pct = (price_ntd / entry_price - 1) * 100
+                    if change_pct <= -Decimal(str(settings["stop_loss_pct"])):
+                        action, reason = "sell", "stop-loss threshold reached"
+                    elif change_pct >= Decimal(str(settings["take_profit_pct"])):
+                        action, reason = "sell", "take-profit threshold reached"
+                evidence.update(
+                    {
+                        "candle_timestamp": candle_timestamp.isoformat(),
+                        "candle_close": _decimal_text(candles[-1].close),
+                        "raw_signal": raw_signal,
+                        "strategy_config": json.loads(str(selection["strategy_config_json"])),
+                    }
+                )
+                source_timestamp = min(source_timestamp, candle_timestamp)
+                prepared.append(
+                    _PreparedDecision(
+                        symbol,
+                        source_timestamp,
+                        strategy_version,
+                        action,
+                        reason,
+                        evidence,
+                        price_ntd,
+                    )
+                )
+
+            # Realize every same-cadence exit before applying entry risk limits. Stable
+            # partitioning preserves selection order within each execution class.
+            for item in sorted(prepared, key=lambda item: item.action != "sell"):
+                decisions.append(
+                    self._execute_decision(
+                        connection,
+                        round_id,
+                        item.symbol,
+                        interval_key,
+                        now,
+                        item.source_timestamp,
+                        item.strategy_version,
+                        item.action,
+                        item.reason,
+                        item.evidence,
+                        item.price_ntd,
+                        settings,
+                        current_prices,
+                        sizing_account,
+                    )
+                )
+
+            account = self._account(connection, round_id, settings, current_prices)
+            connection.execute(
+                "INSERT INTO portfolio_snapshots VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    round_id,
+                    interval_key,
+                    now.isoformat(),
+                    _decimal_text(account.cash_ntd),
+                    _decimal_text(account.position_value_ntd),
+                    _decimal_text(account.realized_pnl_ntd),
+                    _decimal_text(account.unrealized_pnl_ntd),
+                    _decimal_text(account.costs_ntd),
+                    _decimal_text(account.available_capital_ntd),
+                    _decimal_text(account.total_equity_ntd),
+                ),
+            )
+            return EvaluationResult(tuple(decisions), account)
+
+    def _execute_decision(
+        self,
+        connection: sqlite3.Connection,
+        round_id: int,
+        symbol: str,
+        interval_key: str,
+        now: datetime,
+        source_timestamp: datetime,
+        strategy_version: str,
+        action: str,
+        reason: str,
+        evidence: dict[str, object],
+        price_ntd: Decimal,
+        settings: dict[str, object],
+        current_prices: dict[str, Decimal],
+        sizing_account: PortfolioAccount,
+    ) -> TradingDecision:
+        signal_id = hashlib.sha256(
+            f"{round_id}:{symbol}:{interval_key}:{strategy_version}:{action}".encode()
+        ).hexdigest()
+        position = connection.execute(
+            "SELECT * FROM paper_positions WHERE round_id=? AND symbol=?", (round_id, symbol)
+        ).fetchone()
+        rejection: str | None = None
+        if action == "buy":
+            if position is not None:
+                rejection = "position already open"
+            elif connection.execute(
+                "SELECT COUNT(*) FROM paper_positions WHERE round_id=?", (round_id,)
+            ).fetchone()[0] >= int(str(settings["max_concurrent_positions"])):
+                rejection = "maximum concurrent positions reached"
+            elif self._daily_loss_limit_reached(connection, round_id, now, settings):
+                rejection = "daily loss limit reached"
+            elif self._buy_quantity(
+                connection,
+                round_id,
+                price_ntd,
+                settings,
+                current_prices,
+                sizing_account,
+            ) <= 0:
+                rejection = "below minimum executable quantity"
+        elif action == "sell" and position is None:
+            rejection = "no open position"
+        if action == "hold":
+            outcome, persisted_reason = "observed", "no actionable strategy signal"
+        elif rejection:
+            outcome, persisted_reason = "rejected", rejection
+        else:
+            outcome, persisted_reason = "filled", reason
+        connection.execute(
+            "INSERT INTO trading_signals VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                round_id,
+                symbol,
+                interval_key,
+                signal_id,
+                now.isoformat(),
+                source_timestamp.isoformat(),
+                strategy_version,
+                action,
+                outcome,
+                persisted_reason,
+                _json(evidence),
+            ),
+        )
+        if outcome == "filled":
+            self._fill(
+                connection,
+                round_id,
+                signal_id,
+                symbol,
+                action,
+                price_ntd,
+                now,
+                source_timestamp,
+                strategy_version,
+                persisted_reason,
+                settings,
+                current_prices,
+                sizing_account,
+            )
+        return TradingDecision(symbol, action, outcome, persisted_reason, signal_id)
+
+    def _persist_rejection(
+        self,
+        connection: sqlite3.Connection,
+        round_id: int,
+        symbol: str,
+        interval_key: str,
+        now: datetime,
+        source_timestamp: datetime,
+        strategy_version: str,
+        action: str,
+        reason: str,
+        evidence: dict[str, object],
+    ) -> TradingDecision:
+        signal_id = hashlib.sha256(
+            f"{round_id}:{symbol}:{interval_key}:{strategy_version}:{action}".encode()
+        ).hexdigest()
+        connection.execute(
+            "INSERT INTO trading_signals VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'rejected', ?, ?)",
+            (
+                round_id,
+                symbol,
+                interval_key,
+                signal_id,
+                now.isoformat(),
+                source_timestamp.isoformat(),
+                strategy_version,
+                action,
+                reason,
+                _json(evidence),
+            ),
+        )
+        return TradingDecision(symbol, action, "rejected", reason, signal_id)
+
+    def _fill(
+        self,
+        connection: sqlite3.Connection,
+        round_id: int,
+        signal_id: str,
+        symbol: str,
+        side: str,
+        market_price_ntd: Decimal,
+        now: datetime,
+        source_timestamp: datetime,
+        strategy_version: str,
+        reason: str,
+        settings: dict[str, object],
+        current_prices: dict[str, Decimal],
+        sizing_account: PortfolioAccount,
+    ) -> None:
+        fee_rate = Decimal(str(settings["fee_pct"])) / 100
+        slippage_rate = Decimal(str(settings["slippage_pct"])) / 100
+        if side == "buy":
+            fill_price = market_price_ntd * (1 + slippage_rate)
+            quantity = self._buy_quantity(
+                connection,
+                round_id,
+                market_price_ntd,
+                settings,
+                current_prices,
+                sizing_account,
+            )
+            notional = quantity * fill_price
+            fee = notional * fee_rate
+            slippage = quantity * (fill_price - market_price_ntd)
+            realized = Decimal()
+            connection.execute(
+                "INSERT INTO paper_positions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    round_id,
+                    symbol,
+                    _decimal_text(quantity),
+                    _decimal_text(fill_price),
+                    _decimal_text(fee),
+                    now.isoformat(),
+                    strategy_version,
+                    signal_id,
+                ),
+            )
+        else:
+            position = connection.execute(
+                "SELECT * FROM paper_positions WHERE round_id=? AND symbol=?", (round_id, symbol)
+            ).fetchone()
+            quantity = Decimal(str(position["quantity"]))
+            fill_price = market_price_ntd * (1 - slippage_rate)
+            notional = quantity * fill_price
+            fee = notional * fee_rate
+            slippage = quantity * (market_price_ntd - fill_price)
+            basis = quantity * Decimal(str(position["entry_price_ntd"]))
+            realized = notional - fee - basis - Decimal(str(position["entry_cost_ntd"]))
+            connection.execute(
+                "DELETE FROM paper_positions WHERE round_id=? AND symbol=?", (round_id, symbol)
+            )
+        connection.execute(
+            "INSERT INTO paper_trades VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                round_id,
+                signal_id,
+                symbol,
+                side,
+                _decimal_text(quantity),
+                _decimal_text(market_price_ntd),
+                _decimal_text(fill_price),
+                _decimal_text(notional),
+                _decimal_text(fee),
+                _decimal_text(slippage),
+                now.isoformat(),
+                source_timestamp.isoformat(),
+                strategy_version,
+                reason,
+                _decimal_text(realized),
+            ),
+        )
+
+    def _buy_quantity(
+        self,
+        connection: sqlite3.Connection,
+        round_id: int,
+        market_price_ntd: Decimal,
+        settings: dict[str, object],
+        current_prices: dict[str, Decimal],
+        sizing_account: PortfolioAccount,
+    ) -> Decimal:
+        fee_rate = Decimal(str(settings["fee_pct"])) / 100
+        slippage_rate = Decimal(str(settings["slippage_pct"])) / 100
+        account = self._account(connection, round_id, settings, current_prices)
+        allocation = Decimal(str(settings["max_position_allocation_pct"])) / 100
+        budget = min(
+            sizing_account.total_equity_ntd * allocation,
+            sizing_account.cash_ntd,
+            account.cash_ntd,
+        )
+        fill_price = market_price_ntd * (1 + slippage_rate)
+        notional = budget / (1 + fee_rate)
+        return (notional / fill_price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+
+    def _account(
+        self,
+        connection: sqlite3.Connection,
+        round_id: int,
+        settings: dict[str, object],
+        current_prices: dict[str, Decimal],
+    ) -> PortfolioAccount:
+        starting = Decimal(str(settings.get("starting_capital_ntd", "5000")))
+        trades = connection.execute(
+            "SELECT * FROM paper_trades WHERE round_id=? ORDER BY id", (round_id,)
+        ).fetchall()
+        cash = starting
+        realized = Decimal()
+        costs = Decimal()
+        for trade in trades:
+            notional = Decimal(str(trade["notional_ntd"]))
+            fee = Decimal(str(trade["fee_ntd"]))
+            slippage = Decimal(str(trade["slippage_ntd"]))
+            cash += notional - fee if trade["side"] == "sell" else -(notional + fee)
+            realized += Decimal(str(trade["realized_pnl_ntd"]))
+            costs += fee + slippage
+        position_value = unrealized = Decimal()
+        for position in connection.execute(
+            "SELECT * FROM paper_positions WHERE round_id=?", (round_id,)
+        ).fetchall():
+            symbol = str(position["symbol"])
+            quantity = Decimal(str(position["quantity"]))
+            market_price = current_prices.get(symbol)
+            if market_price is None:
+                market_price = Decimal(str(position["entry_price_ntd"]))
+            value = quantity * market_price
+            position_value += value
+            unrealized += value - quantity * Decimal(str(position["entry_price_ntd"]))
+        return PortfolioAccount(
+            cash,
+            position_value,
+            realized,
+            unrealized,
+            costs,
+            cash,
+            cash + position_value,
+        )
+
+    def _daily_loss_limit_reached(
+        self,
+        connection: sqlite3.Connection,
+        round_id: int,
+        now: datetime,
+        settings: dict[str, object],
+    ) -> bool:
+        day = now.astimezone(UTC).date().isoformat()
+        realized = sum(
+            (
+                Decimal(str(row[0]))
+                for row in connection.execute(
+                    "SELECT realized_pnl_ntd FROM paper_trades "
+                    "WHERE round_id=? AND side='sell' AND substr(executed_at, 1, 10)=?",
+                    (round_id, day),
+                )
+            ),
+            Decimal(),
+        )
+        limit = (
+            Decimal(str(settings.get("starting_capital_ntd", "5000")))
+            * Decimal(str(settings["daily_loss_limit_pct"]))
+            / 100
+        )
+        return realized <= -limit
 
     def activate_round(self, settings: RoundPlanningSettings | dict[str, object]) -> RoundPlan:
         if not isinstance(settings, RoundPlanningSettings):

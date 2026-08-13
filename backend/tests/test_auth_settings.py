@@ -41,6 +41,7 @@ def test_api_is_protected_and_single_account_password_is_hashed(tmp_path: Path) 
             (1,),
             (2,),
             (3,),
+            (4,),
         ]
 
 
