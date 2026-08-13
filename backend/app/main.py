@@ -202,6 +202,7 @@ def create_app(
     @app.post("/api/run/start", dependencies=[Depends(authenticated)])
     def start() -> dict[str, object]:
         with database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             active = connection.execute(
                 "SELECT id FROM trading_round WHERE status='active' ORDER BY id DESC LIMIT 1"
             ).fetchone()
@@ -210,13 +211,54 @@ def create_app(
                     "SELECT symbol FROM round_selections WHERE round_id=? ORDER BY selection_rank",
                     (active["id"],),
                 ).fetchall()
-                state = change_state(RunState.RUNNING)
+                incident = connection.execute(
+                    "SELECT 1 FROM market_data_incidents WHERE active=1 LIMIT 1"
+                ).fetchone()
+                operational_state = "degraded" if incident is not None else "running"
+                connection.execute(
+                    "UPDATE trading_run SET desired_state='running', operational_state=?, "
+                    "updated_at=? WHERE id=1", (operational_state, utc_now())
+                )
+                connection.commit()
                 return {
-                    **state,
+                    "desired_state": "running",
+                    "operational_state": operational_state,
                     "round_id": active["id"],
                     "selections": [selection["symbol"] for selection in selections],
                 }
+            pending = connection.execute(
+                "SELECT id FROM lifecycle_transitions WHERE status='pending_plan' LIMIT 1"
+            ).fetchone()
             row = connection.execute("SELECT * FROM run_settings WHERE id=1").fetchone()
+            if pending is not None:
+                connection.execute(
+                    "UPDATE trading_run SET desired_state='running', operational_state='running', "
+                    "updated_at=? WHERE id=1", (utc_now(),)
+                )
+            connection.commit()
+        if pending is not None:
+            result = worker.step()
+            if result.outcome in {"degraded", "backoff"}:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE, "round planning pending retry"
+                )
+            with database.connect() as connection:
+                active = connection.execute(
+                    "SELECT id FROM trading_round WHERE status='active' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                if active is None:
+                    raise HTTPException(
+                        status.HTTP_503_SERVICE_UNAVAILABLE, "round planning remains pending"
+                    )
+                selections = connection.execute(
+                    "SELECT symbol FROM round_selections WHERE round_id=? ORDER BY selection_rank",
+                    (active["id"],),
+                ).fetchall()
+            return {
+                "desired_state": "running", "operational_state": "running",
+                "round_id": active["id"],
+                "selections": [selection["symbol"] for selection in selections],
+            }
         planning_settings = RoundPlanningSettings.from_mapping(dict(row))
         try:
             plan = engine.activate_round(planning_settings)
@@ -240,19 +282,37 @@ def create_app(
         with database.connect() as connection:
             row = connection.execute(
                 """SELECT desired_state, operational_state, current_capital_ntd,
-                starting_capital_ntd
+                starting_capital_ntd, terminal_state, terminal_detail
                 FROM trading_run JOIN run_settings ON run_settings.id = trading_run.id
                 WHERE trading_run.id = 1"""
             ).fetchone()
             failure = connection.execute(
                 "SELECT round_id, occurred_at, reason, active FROM planning_failures "
-                "WHERE active=1 ORDER BY id DESC LIMIT 1"
+                "WHERE active=1 UNION ALL SELECT NULL, occurred_at, reason, active "
+                "FROM transition_planning_failures WHERE active=1 ORDER BY occurred_at DESC LIMIT 1"
             ).fetchone()
             incident = connection.execute(
                 """SELECT round_id, cause, occurred_at, retry_count, next_retry_at,
                 recovered_at, active FROM market_data_incidents
                 ORDER BY id DESC LIMIT 1"""
             ).fetchone()
+            latest_round = connection.execute(
+                "SELECT id, status, started_at, ended_at, ending_equity_ntd FROM trading_round "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            completed_round_count = int(connection.execute(
+                "SELECT COUNT(*) FROM trading_round WHERE status='completed'"
+            ).fetchone()[0])
+            bankruptcy = connection.execute(
+                "SELECT cycle_id, round_id, declared_at, ending_equity_ntd, "
+                "completed_round_count, reason "
+                "FROM bankruptcies ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            current_cycle = connection.execute(
+                "SELECT id, status, started_at, starting_capital_ntd, completed_round_count "
+                "FROM cycles WHERE status='active' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            cycle_count = int(connection.execute("SELECT COUNT(*) FROM cycles").fetchone()[0])
         active_incident = incident is not None and bool(incident["active"])
         health = "degraded" if failure or active_incident else "healthy"
         detail = incident["cause"] if active_incident else failure["reason"] if failure else None
@@ -265,6 +325,24 @@ def create_app(
             "health": health,
             "health_detail": detail,
             "operational_state": row["operational_state"],
+            "run_status": row["terminal_state"] or row["desired_state"],
+            "round_status": latest_round["status"] if latest_round else None,
+            "current_round": dict(latest_round) if latest_round else None,
+            "completed_round_count": completed_round_count,
+            "cycle_count": cycle_count,
+            "current_cycle": dict(current_cycle) if current_cycle else None,
+            "bankruptcy": dict(bankruptcy) if bankruptcy else None,
+            "latest_bankruptcy": dict(bankruptcy) if bankruptcy else None,
+            "days_since_bankruptcy": (
+                max(
+                    0,
+                    (planning_clock() - datetime.fromisoformat(
+                        str(bankruptcy["declared_at"]).replace("Z", "+00:00")
+                    )).days,
+                )
+                if bankruptcy
+                else None
+            ),
             "market_data_incident": dict(incident) if incident else None,
             "planning_failure": (
                 {

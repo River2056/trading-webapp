@@ -9,7 +9,14 @@ from datetime import UTC, datetime, timedelta
 from urllib.error import HTTPError, URLError
 
 from .database import Database
-from .engine import MarketDataSafetyError, RoundPlanningError, TradingEngine
+from .engine import (
+    MarketDataSafetyError,
+    RoundPlanningError,
+    RoundPlanningSettings,
+    TradingEngine,
+    UnfundablePlanningError,
+)
+from .lifecycle import RoundLifecycle
 from .market_data import MarketDataError
 
 
@@ -87,6 +94,21 @@ class TradingWorker:
 
                 connection.execute("SAVEPOINT engine_evaluation")
                 try:
+                    rollover = RoundLifecycle(
+                        self.database, self.engine.market_data, self.clock
+                    ).close_due_round(connection)
+                    if rollover is not None:
+                        connection.execute("RELEASE SAVEPOINT engine_evaluation")
+                        connection.commit()
+                        return self._activate_pending_transition(now)
+                    pending = connection.execute(
+                        "SELECT id FROM lifecycle_transitions WHERE status='pending_plan' "
+                        "ORDER BY id LIMIT 1"
+                    ).fetchone()
+                    if pending is not None:
+                        connection.execute("RELEASE SAVEPOINT engine_evaluation")
+                        connection.commit()
+                        return self._activate_pending_transition(now)
                     self.engine.evaluate_active_round(
                         require_safe_data=True,
                         connection=connection,
@@ -107,6 +129,88 @@ class TradingWorker:
                     self._checkpoint("stopped", now)
                     return WorkerResult("stopped")
                 raise
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def _activate_pending_transition(self, now: datetime) -> WorkerResult:
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                run = connection.execute(
+                    "SELECT desired_state FROM trading_run WHERE id=1"
+                ).fetchone()
+                if run is None or run["desired_state"] != "running":
+                    self._complete(connection, "stopped", self._timestamp(now), success=False)
+                    connection.commit()
+                    return WorkerResult("stopped")
+                transition = connection.execute(
+                    "SELECT * FROM lifecycle_transitions WHERE status='pending_plan' "
+                    "ORDER BY id LIMIT 1"
+                ).fetchone()
+                if transition is None:
+                    connection.commit()
+                    return WorkerResult("advanced")
+                settings_row = connection.execute(
+                    "SELECT * FROM run_settings WHERE id=1"
+                ).fetchone()
+                next_settings = dict(settings_row)
+                next_settings["starting_capital_ntd"] = str(
+                    transition["next_starting_capital_ntd"]
+                )
+                transition_id = int(transition["id"])
+
+                def completed(active: sqlite3.Connection, _plan: object) -> None:
+                    timestamp = self._timestamp(now)
+                    active.execute(
+                        "UPDATE market_data_incidents SET active=0, recovered_at=?, "
+                        "next_retry_at=NULL WHERE active=1", (timestamp,),
+                    )
+                    active.execute(
+                        "UPDATE transition_planning_failures SET active=0 WHERE active=1"
+                    )
+                    self._complete(active, "advanced", timestamp, success=True)
+
+                try:
+                    self.engine.activate_round(
+                        RoundPlanningSettings.from_mapping(next_settings),
+                        transition_id=transition_id,
+                        connection=connection,
+                        completion_hook=completed,
+                    )
+                except UnfundablePlanningError as error:
+                    connection.rollback()
+                    connection.execute("BEGIN IMMEDIATE")
+                    transition = connection.execute(
+                        "SELECT * FROM lifecycle_transitions WHERE id=? AND status='pending_plan'",
+                        (transition_id,),
+                    ).fetchone()
+                    if transition is None:
+                        connection.commit()
+                        return WorkerResult("advanced")
+                    default_capital = RoundLifecycle(
+                        self.database, self.engine.market_data, self.clock
+                    ).reset_bankrupt_cycle(connection, transition_id, str(error))
+                    del default_capital
+                    connection.commit()
+                    return self._activate_pending_transition(now)
+                except (
+                    RoundPlanningError,
+                    MarketDataSafetyError,
+                    *_EXPECTED_DATA_FAILURES,
+                ) as error:
+                    connection.rollback()
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        "INSERT INTO transition_planning_failures"
+                        "(transition_id, occurred_at, reason, active) VALUES(?, ?, ?, 1)",
+                        (transition_id, self._timestamp(now), str(error)),
+                    )
+                    result = self._degrade(connection, str(error), now)
+                    connection.commit()
+                    return result
+                connection.commit()
+                return WorkerResult("rolled_over")
             except BaseException:
                 connection.rollback()
                 raise

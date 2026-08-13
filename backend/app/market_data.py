@@ -48,6 +48,15 @@ class NtdConversion:
 
 
 @dataclass(frozen=True)
+class MarketRules:
+    symbol: str
+    min_quantity: Decimal
+    step_size: Decimal
+    min_notional_ntd: Decimal
+    provider: str
+
+
+@dataclass(frozen=True)
 class Candle:
     opened_at: datetime
     open: Decimal
@@ -61,6 +70,7 @@ class MarketData(Protocol):
     def market_summaries(self) -> list[MarketSummary]: ...
     def ntd_conversion(self, quote_asset: str) -> NtdConversion: ...
     def historical_candles(self, symbol: str, interval: str, limit: int) -> list[Candle]: ...
+    def market_rules(self, symbol: str) -> MarketRules: ...
 
 
 JsonTransport = Callable[[str, dict[str, str]], object]
@@ -92,6 +102,33 @@ class BinanceMarketData:
         self._fx_url = fx_url
         self._max_conversion_age = max_conversion_age
         self.provider = "Binance public API"
+
+    def market_rules(self, symbol: str) -> MarketRules:
+        payload = self._transport(f"{self._base_url}/exchangeInfo", {"symbol": symbol})
+        try:
+            if not isinstance(payload, dict) or not isinstance(payload["symbols"], list):
+                raise MarketDataError("malformed Binance market rules")
+            item = next(value for value in payload["symbols"] if value["symbol"] == symbol)
+            filters = {value["filterType"]: value for value in item["filters"]}
+            lot = filters["LOT_SIZE"]
+            notional = filters.get("NOTIONAL") or filters["MIN_NOTIONAL"]
+            quote_asset = str(item["quoteAsset"])
+            conversion = self.ntd_conversion(quote_asset)
+            rules = MarketRules(
+                symbol,
+                Decimal(str(lot["minQty"])),
+                Decimal(str(lot["stepSize"])),
+                Decimal(str(notional["minNotional"])) * conversion.rate,
+                self.provider,
+            )
+        except (KeyError, StopIteration, TypeError, InvalidOperation) as error:
+            raise MarketDataError("malformed Binance market rules") from error
+        if not all(
+            value.is_finite() and value > 0
+            for value in (rules.min_quantity, rules.step_size, rules.min_notional_ntd)
+        ):
+            raise MarketDataError("invalid Binance market rules")
+        return rules
 
     def market_summaries(self) -> list[MarketSummary]:
         payload = self._transport(f"{self._base_url}/ticker/24hr", {})

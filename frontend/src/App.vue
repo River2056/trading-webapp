@@ -8,6 +8,12 @@ type Dashboard = {
   current_capital_ntd: string
   engine_health: 'healthy' | 'degraded'
   operational_state: 'running' | 'stopped' | 'degraded'
+  run_status?: 'running' | 'stopped' | 'bankrupt'
+  round_status?: 'planning' | 'active' | 'completed' | 'failed' | null
+  completed_round_count?: number
+  cycle_count?: number
+  days_since_bankruptcy?: number | null
+  bankruptcy?: { reason: string; declared_at: string; ending_equity_ntd: string } | null
   planning_failure: { reason: string; occurred_at: string } | null
   market_data_incident: {
     cause: string
@@ -144,9 +150,16 @@ onMounted(loadDashboard)
           recovered {{ dashboard.market_data_incident.recovered_at }}
         </p>
       </section>
+      <section v-if="dashboard.bankruptcy" class="card incident-history">
+        <strong>Latest bankruptcy and reset</strong>
+        <p>{{ dashboard.bankruptcy.reason }}</p>
+        <p>Ending equity NT${{ dashboard.bankruptcy.ending_equity_ntd }} · declared {{ dashboard.bankruptcy.declared_at }}</p>
+        <p>Cycle {{ dashboard.cycle_count }} · {{ dashboard.days_since_bankruptcy }} days since bankruptcy</p>
+      </section>
       <section class="metrics">
         <article class="card"><p>Configured capital</p><strong>{{ Number(dashboard.configured_capital_ntd).toLocaleString('en-US', { style: 'currency', currency: 'TWD' }) }}</strong></article>
         <article class="card"><p>Current capital</p><strong>{{ Number(dashboard.current_capital_ntd).toLocaleString('en-US', { style: 'currency', currency: 'TWD' }) }}</strong></article>
+        <article class="card"><p>Round status</p><strong>{{ dashboard.round_status || 'Not started' }}</strong><small>{{ dashboard.completed_round_count || 0 }} completed</small></article>
       </section>
       <section v-if="dashboard.desired_state === 'stopped' && settings" class="card settings">
         <h2>Run settings</h2>

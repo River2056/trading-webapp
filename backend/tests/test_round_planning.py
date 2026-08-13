@@ -8,12 +8,18 @@ from pathlib import Path
 import pytest
 
 from backend.app.database import Database
-from backend.app.engine import RoundPlanningError, RoundPlanningSettings, TradingEngine
+from backend.app.engine import (
+    RoundPlanningError,
+    RoundPlanningSettings,
+    TradingEngine,
+    executable_quantity,
+)
 from backend.app.market_data import (
     Candle,
     ConversionLeg,
     ConversionProvenance,
     MarketDataError,
+    MarketRules,
     MarketSummary,
     NtdConversion,
 )
@@ -38,6 +44,15 @@ class FixtureMarketData:
             )
             for index, symbol in enumerate(symbols[: self.count])
         ]
+
+    def market_rules(self, symbol: str) -> MarketRules:
+        return MarketRules(
+            symbol,
+            Decimal("0.000001"),
+            Decimal("0.000001"),
+            Decimal("0.000001"),
+            "fixture",
+        )
 
     def ntd_conversion(self, quote_asset: str) -> NtdConversion:
         assert quote_asset == "USDT"
@@ -92,11 +107,26 @@ class QualificationFixtureMarketData(FixtureMarketData):
         return super().historical_candles(symbol, interval, limit)
 
 
+class SymbolRulesFixtureMarketData(FixtureMarketData):
+    def market_rules(self, symbol: str) -> MarketRules:
+        minimum_notional = Decimal("100000") if symbol == "BTCUSDT" else Decimal("1")
+        return MarketRules(
+            symbol, Decimal("0.000001"), Decimal("0.000001"), minimum_notional, "fixture"
+        )
+
+
 class BrokenCandidateMarketData(FixtureMarketData):
     def historical_candles(self, symbol: str, interval: str, limit: int) -> list[Candle]:
         if symbol == "BTCUSDT":
             raise MarketDataError("malformed candidate candles")
         return super().historical_candles(symbol, interval, limit)
+
+
+class MixedUnknownFundabilityMarketData(SymbolRulesFixtureMarketData):
+    def market_rules(self, symbol: str) -> MarketRules:
+        if symbol != "BTCUSDT":
+            raise MarketDataError("exchange rules temporarily unavailable")
+        return super().market_rules(symbol)
 
 
 def settings() -> dict[str, object]:
@@ -117,6 +147,64 @@ def settings() -> dict[str, object]:
         "max_conversion_age_seconds": 86400,
         "max_candle_age_seconds": 7200,
     }
+
+
+def test_executable_quantity_floors_step_and_enforces_exchange_minimums() -> None:
+    configured = settings()
+    configured["max_position_allocation_pct"] = Decimal("100")
+    rules = MarketRules(
+        "CHEAPUSDT", Decimal("0.1"), Decimal("0.1"), Decimal("300"), "fixture"
+    )
+
+    assert executable_quantity(Decimal("299"), Decimal("1"), configured, rules) == 0
+    assert executable_quantity(Decimal("1000"), Decimal("3"), configured, rules) == Decimal(
+        "332.6"
+    )
+
+
+def test_planning_excludes_high_ranked_min_notional_and_selects_affordable_candidate(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "rules.sqlite3")
+    database.migrate()
+    database.ensure_defaults()
+    engine = TradingEngine(
+        database,
+        SymbolRulesFixtureMarketData(),
+        lambda: datetime(2026, 1, 8, 12, tzinfo=UTC),
+    )
+
+    plan = engine.activate_round(settings())
+
+    assert [selection.symbol for selection in plan.selections] == [
+        "ETHUSDT",
+        "SOLUSDT",
+        "ADAUSDT",
+        "XRPUSDT",
+        "DOGEUSDT",
+    ]
+    with database.connect() as connection:
+        btc = connection.execute(
+            "SELECT exclusion_reason FROM market_rankings WHERE round_id=? AND symbol='BTCUSDT'",
+            (plan.round_id,),
+        ).fetchone()
+    assert btc["exclusion_reason"] == "below minimum executable quantity"
+
+
+def test_unknown_candidate_fundability_prevents_false_bankruptcy(tmp_path: Path) -> None:
+    database = Database(tmp_path / "unknown-fundability.sqlite3")
+    database.migrate()
+    database.ensure_defaults()
+    engine = TradingEngine(
+        database,
+        MixedUnknownFundabilityMarketData(),
+        lambda: datetime(2026, 1, 8, 12, tzinfo=UTC),
+    )
+
+    with pytest.raises(RoundPlanningError, match="five markets") as raised:
+        engine.activate_round(settings())
+
+    assert raised.type is RoundPlanningError
 
 
 def test_engine_selects_five_markets_and_persists_an_immutable_auditable_plan(

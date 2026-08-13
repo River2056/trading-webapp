@@ -10,11 +10,22 @@ from decimal import ROUND_DOWN, Decimal
 from typing import Protocol
 
 from .database import Database
-from .market_data import Candle, MarketData, MarketDataError, MarketSummary, NtdConversion
+from .market_data import (
+    Candle,
+    MarketData,
+    MarketDataError,
+    MarketRules,
+    MarketSummary,
+    NtdConversion,
+)
 
 
 class RoundPlanningError(RuntimeError):
     pass
+
+
+class UnfundablePlanningError(RoundPlanningError):
+    """Every otherwise-qualified candidate failed the executable-quantity gate."""
 
 
 class MarketDataSafetyError(RuntimeError):
@@ -40,6 +51,7 @@ class RoundPlanningSettings:
     minimum_trade_count: int = 2
     max_conversion_age_seconds: int = 86400
     max_candle_age_seconds: int = 7200
+    round_duration_days: int = 7
 
     @classmethod
     def from_mapping(cls, values: dict[str, object]) -> RoundPlanningSettings:
@@ -61,6 +73,7 @@ class RoundPlanningSettings:
             minimum_trade_count=int(str(values.get("minimum_trade_count", 2))),
             max_conversion_age_seconds=int(str(values.get("max_conversion_age_seconds", 86400))),
             max_candle_age_seconds=int(str(values.get("max_candle_age_seconds", 7200))),
+            round_duration_days=int(str(values.get("round_duration_days", 7))),
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -323,6 +336,36 @@ def _json(value: object) -> str:
 
 def _decimal_text(value: Decimal) -> str:
     return format(value.normalize(), "f")
+
+
+def executable_quantity(
+    equity: Decimal,
+    market_price_ntd: Decimal,
+    settings: RoundPlanningSettings | dict[str, object],
+    rules: MarketRules | None = None,
+) -> Decimal:
+    """Authoritative executable entry quantity used by planning and execution."""
+    values = settings.as_dict() if isinstance(settings, RoundPlanningSettings) else settings
+    if (
+        not equity.is_finite()
+        or equity <= 0
+        or not market_price_ntd.is_finite()
+        or market_price_ntd <= 0
+    ):
+        return Decimal()
+    allocation = Decimal(str(values["max_position_allocation_pct"])) / 100
+    fee = Decimal(str(values["fee_pct"])) / 100
+    slippage = Decimal(str(values["slippage_pct"])) / 100
+    budget = equity * allocation
+    raw = budget / (1 + fee) / (market_price_ntd * (1 + slippage))
+    step = rules.step_size if rules is not None else Decimal("0.000001")
+    quantity = (raw / step).to_integral_value(rounding=ROUND_DOWN) * step
+    if rules is not None and (
+        quantity < rules.min_quantity
+        or quantity * market_price_ntd < rules.min_notional_ntd
+    ):
+        return Decimal()
+    return quantity
 
 
 def _strategy_from_record(version: str, configuration_json: str) -> Strategy:
@@ -823,6 +866,7 @@ class TradingEngine:
             elif self._buy_quantity(
                 connection,
                 round_id,
+                symbol,
                 price_ntd,
                 settings,
                 current_prices,
@@ -929,6 +973,7 @@ class TradingEngine:
             quantity = self._buy_quantity(
                 connection,
                 round_id,
+                symbol,
                 market_price_ntd,
                 settings,
                 current_prices,
@@ -990,23 +1035,23 @@ class TradingEngine:
         self,
         connection: sqlite3.Connection,
         round_id: int,
+        symbol: str,
         market_price_ntd: Decimal,
         settings: dict[str, object],
         current_prices: dict[str, Decimal],
         sizing_account: PortfolioAccount,
     ) -> Decimal:
-        fee_rate = Decimal(str(settings["fee_pct"])) / 100
-        slippage_rate = Decimal(str(settings["slippage_pct"])) / 100
         account = self._account(connection, round_id, settings, current_prices)
-        allocation = Decimal(str(settings["max_position_allocation_pct"])) / 100
-        budget = min(
-            sizing_account.total_equity_ntd * allocation,
+        equity = min(
+            sizing_account.total_equity_ntd,
             sizing_account.cash_ntd,
             account.cash_ntd,
         )
-        fill_price = market_price_ntd * (1 + slippage_rate)
-        notional = budget / (1 + fee_rate)
-        return (notional / fill_price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+        try:
+            rules = self.market_data.market_rules(symbol)
+        except (AttributeError, MarketDataError) as error:
+            raise MarketDataSafetyError(f"{symbol}: market rules unavailable: {error}") from error
+        return executable_quantity(equity, market_price_ntd, settings, rules)
 
     def _account(
         self,
@@ -1077,37 +1122,99 @@ class TradingEngine:
         )
         return realized <= -limit
 
-    def activate_round(self, settings: RoundPlanningSettings | dict[str, object]) -> RoundPlan:
+    def activate_round(
+        self,
+        settings: RoundPlanningSettings | dict[str, object],
+        *,
+        transition_id: int | None = None,
+        connection: sqlite3.Connection | None = None,
+        completion_hook: Callable[[sqlite3.Connection, RoundPlan], None] | None = None,
+    ) -> RoundPlan:
         if not isinstance(settings, RoundPlanningSettings):
             settings = RoundPlanningSettings.from_mapping(settings)
+        if connection is None:
+            with self.database.connect() as owned:
+                owned.execute("BEGIN IMMEDIATE")
+                try:
+                    plan = self.activate_round(
+                        settings,
+                        transition_id=transition_id,
+                        connection=owned,
+                        completion_hook=completion_hook,
+                    )
+                    owned.commit()
+                    return plan
+                except (MarketDataError, RoundPlanningError, ValueError, KeyError) as error:
+                    round_row = owned.execute(
+                        "SELECT id FROM trading_round WHERE status='planning' "
+                        "ORDER BY id DESC LIMIT 1"
+                    ).fetchone()
+                    if round_row is not None:
+                        owned.execute(
+                            "INSERT INTO planning_failures"
+                            "(round_id, occurred_at, reason, active) VALUES (?, ?, ?, 1)",
+                            (round_row["id"], self.clock().isoformat(), str(error)),
+                        )
+                        owned.execute(
+                            "UPDATE trading_round SET status='failed' WHERE id=?",
+                            (round_row["id"],),
+                        )
+                    owned.commit()
+                    raise
+                except BaseException:
+                    owned.rollback()
+                    raise
         now = self.clock().isoformat(timespec="seconds").replace("+00:00", "Z")
-        with self.database.connect() as connection, connection:
+        if transition_id is not None:
+            transition = connection.execute(
+                "SELECT status, activated_round_id FROM lifecycle_transitions WHERE id=?",
+                (transition_id,),
+            ).fetchone()
+            if transition is None or transition["status"] != "pending_plan":
+                raise RoundPlanningError("lifecycle transition is no longer pending")
+        try:
+            cycle = connection.execute(
+                "SELECT id FROM cycles WHERE status='active' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if cycle is None:
+                cursor = connection.execute(
+                    "INSERT INTO cycles(status, started_at, starting_capital_ntd) "
+                    "VALUES('active', ?, ?)",
+                    (now, _decimal_text(settings.starting_capital_ntd)),
+                )
+                cycle_id = cursor.lastrowid
+            else:
+                cycle_id = cycle["id"]
             cursor = connection.execute(
-                "INSERT INTO trading_round(status, started_at, frozen_settings_json) "
-                "VALUES(?, ?, ?)",
-                ("planning", now, _json(settings.as_dict())),
+                "INSERT INTO trading_round(status, started_at, frozen_settings_json, cycle_id, "
+                "lifecycle_transition_id) VALUES(?, ?, ?, ?, ?)",
+                ("planning", now, _json(settings.as_dict()), cycle_id, transition_id),
             )
             if cursor.lastrowid is None:
                 raise RoundPlanningError("failed to create round")
-            round_id = cursor.lastrowid
-
-        try:
-            return self._plan_round(round_id, settings)
+            round_id = int(cursor.lastrowid)
+            plan = self._plan_round(connection, round_id, settings)
+            if transition_id is not None:
+                if self.fault_injector is not None:
+                    self.fault_injector("after_plan_activation")
+                changed = connection.execute(
+                    "UPDATE lifecycle_transitions SET status='completed', "
+                    "activated_round_id=?, completed_at=? WHERE id=? AND status='pending_plan'",
+                    (round_id, now, transition_id),
+                ).rowcount
+                if changed != 1:
+                    raise RoundPlanningError("lifecycle transition was concurrently completed")
+            if completion_hook is not None:
+                completion_hook(connection, plan)
+            return plan
         except (MarketDataError, RoundPlanningError, ValueError, KeyError) as error:
-            with self.database.connect() as connection, connection:
-                connection.execute(
-                    "INSERT INTO planning_failures"
-                    "(round_id, occurred_at, reason, active) VALUES (?, ?, ?, 1)",
-                    (round_id, now, str(error)),
-                )
-                connection.execute(
-                    "UPDATE trading_round SET status='failed' WHERE id=?", (round_id,)
-                )
             if isinstance(error, RoundPlanningError):
                 raise
             raise RoundPlanningError(str(error)) from error
 
-    def _plan_round(self, round_id: int, settings: RoundPlanningSettings) -> RoundPlan:
+    def _plan_round(
+        self, connection: sqlite3.Connection, round_id: int, settings: RoundPlanningSettings
+    ) -> RoundPlan:
         summaries = sorted(self.market_data.market_summaries(), key=lambda item: item.symbol)
         self.last_exclusions = {}
         ranked: list[tuple[MarketSummary, NtdConversion, Decimal]] = []
@@ -1158,169 +1265,202 @@ class TradingEngine:
         strategies: list[Strategy] = [RsiStrategy(), MacdStrategy()]
         selections: list[Selection] = []
 
-        with self.database.connect() as connection, connection:
-            for summary in summaries:
-                eligible = next((item for item in ranked if item[0].symbol == summary.symbol), None)
-                persisted_conversion = eligible[1] if eligible else None
-                persisted_liquidity = eligible[2] if eligible else None
-                rank = rank_by_symbol.get(summary.symbol)
+        qualified_candidates = 0
+        fundable_candidates = 0
+        unknown_fundability_candidates = 0
+        for summary in summaries:
+            eligible = next((item for item in ranked if item[0].symbol == summary.symbol), None)
+            persisted_conversion = eligible[1] if eligible else None
+            persisted_liquidity = eligible[2] if eligible else None
+            rank = rank_by_symbol.get(summary.symbol)
+            connection.execute(
+                "INSERT INTO market_rankings VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    round_id,
+                    summary.symbol,
+                    summary.observed_at.isoformat(),
+                    summary.base_asset,
+                    summary.quote_asset,
+                    _decimal_text(summary.last_price),
+                    _decimal_text(summary.quote_volume),
+                    persisted_conversion.path if persisted_conversion else None,
+                    _decimal_text(persisted_conversion.rate) if persisted_conversion else None,
+                    persisted_conversion.observed_at.isoformat()
+                    if persisted_conversion
+                    else None,
+                    _json(asdict(persisted_conversion.provenance))
+                    if persisted_conversion and persisted_conversion.provenance
+                    else None,
+                    _decimal_text(persisted_liquidity) if persisted_liquidity else None,
+                    _decimal_text(persisted_liquidity) if persisted_liquidity else None,
+                    rank,
+                    0,
+                    self.last_exclusions.get(summary.symbol),
+                ),
+            )
+
+        for summary, _conversion, _liquidity in ranked:
+            try:
+                rules = self.market_data.market_rules(summary.symbol)
+                candles = self.market_data.historical_candles(
+                    summary.symbol, interval, lookback
+                )
+                candle_age = (self.clock() - candles[-1].opened_at).total_seconds()
+                if candle_age < 0:
+                    raise MarketDataError("future candidate candles")
+                if candle_age > settings.max_candle_age_seconds:
+                    raise MarketDataError("stale candidate candles")
+                if any(
+                    candle.opened_at > self.clock()
+                    or not all(
+                        value.is_finite()
+                        for value in (
+                            candle.open,
+                            candle.high,
+                            candle.low,
+                            candle.close,
+                            candle.volume,
+                        )
+                    )
+                    for candle in candles
+                ):
+                    raise MarketDataError("invalid candidate candles")
+                results = [backtester.run(strategy, candles) for strategy in strategies]
+            except (MarketDataError, RoundPlanningError, ValueError, IndexError) as error:
+                # A candidate whose required rules/candles are unavailable cannot
+                # prove that the portfolio is bankrupt. It remains excluded from
+                # this plan, but forces a recoverable planning failure instead of
+                # an irreversible cycle reset.
+                unknown_fundability_candidates += 1
+                self.last_exclusions[summary.symbol] = str(error)
                 connection.execute(
-                    "INSERT INTO market_rankings VALUES "
-                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "UPDATE market_rankings SET exclusion_reason=? "
+                    "WHERE round_id=? AND symbol=?",
+                    (str(error), round_id, summary.symbol),
+                )
+                continue
+            canonical_rows = [
+                [
+                    candle.opened_at.isoformat(),
+                    _decimal_text(candle.open),
+                    _decimal_text(candle.high),
+                    _decimal_text(candle.low),
+                    _decimal_text(candle.close),
+                    _decimal_text(candle.volume),
+                ]
+                for candle in candles
+            ]
+            provider = getattr(self.market_data, "provider", "fixture-market-data")
+            candle_provenance = {
+                "source": provider,
+                "provider": provider,
+                "symbol": summary.symbol,
+                "interval": interval,
+                "requested_count": lookback,
+                "actual_count": len(candles),
+                "first_candle_at": candles[0].opened_at.isoformat(),
+                "last_candle_at": candles[-1].opened_at.isoformat(),
+                "first_timestamp": candles[0].opened_at.isoformat(),
+                "last_timestamp": candles[-1].opened_at.isoformat(),
+                "sha256": hashlib.sha256(_json(canonical_rows).encode()).hexdigest(),
+            }
+            for result in results:
+                assumptions = dict(result.assumptions)
+                assumptions["candles"] = candle_provenance
+                assumptions["qualification"] = {
+                    "minimum_net_return_pct": _decimal_text(settings.minimum_net_return_pct),
+                    "minimum_entry_count": settings.minimum_entry_count,
+                    "minimum_trade_count": settings.minimum_trade_count,
+                }
+                assumptions["qualification_gates"] = assumptions["qualification"]
+                connection.execute(
+                    "INSERT INTO backtest_results VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         round_id,
                         summary.symbol,
-                        summary.observed_at.isoformat(),
-                        summary.base_asset,
-                        summary.quote_asset,
-                        _decimal_text(summary.last_price),
-                        _decimal_text(summary.quote_volume),
-                        persisted_conversion.path if persisted_conversion else None,
-                        _decimal_text(persisted_conversion.rate) if persisted_conversion else None,
-                        persisted_conversion.observed_at.isoformat()
-                        if persisted_conversion
-                        else None,
-                        _json(asdict(persisted_conversion.provenance))
-                        if persisted_conversion and persisted_conversion.provenance
-                        else None,
-                        _decimal_text(persisted_liquidity) if persisted_liquidity else None,
-                        _decimal_text(persisted_liquidity) if persisted_liquidity else None,
-                        rank,
-                        0,
-                        self.last_exclusions.get(summary.symbol),
+                        result.strategy_version,
+                        _json(assumptions),
+                        _json(result.metrics),
+                        int(result.qualifies(settings)),
+                        _decimal_text(result.score),
                     ),
                 )
-
-            for summary, _conversion, _liquidity in ranked:
-                try:
-                    candles = self.market_data.historical_candles(
-                        summary.symbol, interval, lookback
-                    )
-                    candle_age = (self.clock() - candles[-1].opened_at).total_seconds()
-                    if candle_age < 0:
-                        raise MarketDataError("future candidate candles")
-                    if candle_age > settings.max_candle_age_seconds:
-                        raise MarketDataError("stale candidate candles")
-                    if any(
-                        candle.opened_at > self.clock()
-                        or not all(
-                            value.is_finite()
-                            for value in (
-                                candle.open,
-                                candle.high,
-                                candle.low,
-                                candle.close,
-                                candle.volume,
-                            )
-                        )
-                        for candle in candles
-                    ):
-                        raise MarketDataError("invalid candidate candles")
-                    results = [backtester.run(strategy, candles) for strategy in strategies]
-                except (MarketDataError, RoundPlanningError, ValueError, IndexError) as error:
-                    self.last_exclusions[summary.symbol] = str(error)
-                    connection.execute(
-                        "UPDATE market_rankings SET exclusion_reason=? "
-                        "WHERE round_id=? AND symbol=?",
-                        (str(error), round_id, summary.symbol),
-                    )
-                    continue
-                canonical_rows = [
-                    [
-                        candle.opened_at.isoformat(),
-                        _decimal_text(candle.open),
-                        _decimal_text(candle.high),
-                        _decimal_text(candle.low),
-                        _decimal_text(candle.close),
-                        _decimal_text(candle.volume),
-                    ]
-                    for candle in candles
-                ]
-                provider = getattr(self.market_data, "provider", "fixture-market-data")
-                candle_provenance = {
-                    "source": provider,
-                    "provider": provider,
-                    "symbol": summary.symbol,
-                    "interval": interval,
-                    "requested_count": lookback,
-                    "actual_count": len(candles),
-                    "first_candle_at": candles[0].opened_at.isoformat(),
-                    "last_candle_at": candles[-1].opened_at.isoformat(),
-                    "first_timestamp": candles[0].opened_at.isoformat(),
-                    "last_timestamp": candles[-1].opened_at.isoformat(),
-                    "sha256": hashlib.sha256(_json(canonical_rows).encode()).hexdigest(),
-                }
-                for result in results:
-                    assumptions = dict(result.assumptions)
-                    assumptions["candles"] = candle_provenance
-                    assumptions["qualification"] = {
-                        "minimum_net_return_pct": _decimal_text(settings.minimum_net_return_pct),
-                        "minimum_entry_count": settings.minimum_entry_count,
-                        "minimum_trade_count": settings.minimum_trade_count,
-                    }
-                    assumptions["qualification_gates"] = assumptions["qualification"]
-                    connection.execute(
-                        "INSERT INTO backtest_results VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            round_id,
-                            summary.symbol,
-                            result.strategy_version,
-                            _json(assumptions),
-                            _json(result.metrics),
-                            int(result.qualifies(settings)),
-                            _decimal_text(result.score),
-                        ),
-                    )
-                qualified = sorted(
-                    (result for result in results if result.qualifies(settings)),
-                    key=lambda result: (-result.score, result.strategy_version),
-                )
-                if not qualified:
-                    connection.execute(
-                        "UPDATE market_rankings SET exclusion_reason=? "
-                        "WHERE round_id=? AND symbol=?",
-                        ("no qualifying strategy", round_id, summary.symbol),
-                    )
-                    continue
-                chosen = qualified[0]
-                selection = Selection(summary.symbol, chosen.strategy_version, chosen.configuration)
-                selections.append(selection)
-                selection_rank = len(selections)
+            qualified = sorted(
+                (result for result in results if result.qualifies(settings)),
+                key=lambda result: (-result.score, result.strategy_version),
+            )
+            if not qualified:
                 connection.execute(
-                    "UPDATE market_rankings SET selected=1 WHERE round_id=? AND symbol=?",
+                    "UPDATE market_rankings SET exclusion_reason=? "
+                    "WHERE round_id=? AND symbol=?",
+                    ("no qualifying strategy", round_id, summary.symbol),
+                )
+                continue
+            chosen = qualified[0]
+            qualified_candidates += 1
+            market_price_ntd = summary.last_price * _conversion.rate
+            if executable_quantity(
+                settings.starting_capital_ntd, market_price_ntd, settings, rules
+            ) <= 0:
+                self.last_exclusions[summary.symbol] = "below minimum executable quantity"
+                connection.execute(
+                    "UPDATE market_rankings SET exclusion_reason=? "
+                    "WHERE round_id=? AND symbol=?",
+                    ("below minimum executable quantity", round_id, summary.symbol),
+                )
+                continue
+            fundable_candidates += 1
+            selection = Selection(summary.symbol, chosen.strategy_version, chosen.configuration)
+            selections.append(selection)
+            selection_rank = len(selections)
+            connection.execute(
+                "UPDATE market_rankings SET selected=1 WHERE round_id=? AND symbol=?",
+                (round_id, summary.symbol),
+            )
+            connection.execute(
+                "INSERT INTO round_selections VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    round_id,
+                    summary.symbol,
+                    selection_rank,
+                    selection.strategy_version,
+                    _json(selection.strategy_config),
+                    _json({
+                        "candles": candle_provenance,
+                        "metrics": chosen.metrics,
+                        "market_rules": asdict(rules),
+                    }),
+                ),
+            )
+            # Continue through the eligible universe so every candidate's
+            # backtest evidence is retained. Only the first five qualifiers
+            # become selections.
+            if len(selections) > 5:
+                selections.pop()
+                connection.execute(
+                    "UPDATE market_rankings SET selected=0 WHERE round_id=? AND symbol=?",
                     (round_id, summary.symbol),
                 )
                 connection.execute(
-                    "INSERT INTO round_selections VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        round_id,
-                        summary.symbol,
-                        selection_rank,
-                        selection.strategy_version,
-                        _json(selection.strategy_config),
-                        _json({"candles": candle_provenance, "metrics": chosen.metrics}),
-                    ),
+                    "DELETE FROM round_selections WHERE round_id=? AND symbol=?",
+                    (round_id, summary.symbol),
                 )
-                # Continue through the eligible universe so every candidate's
-                # backtest evidence is retained. Only the first five qualifiers
-                # become selections.
-                if len(selections) > 5:
-                    selections.pop()
-                    connection.execute(
-                        "UPDATE market_rankings SET selected=0 WHERE round_id=? AND symbol=?",
-                        (round_id, summary.symbol),
-                    )
-                    connection.execute(
-                        "DELETE FROM round_selections WHERE round_id=? AND symbol=?",
-                        (round_id, summary.symbol),
-                    )
-            enough_selections = len(selections) >= 5
-            if enough_selections:
-                connection.execute(
-                    "UPDATE trading_round SET status='active' WHERE id=?", (round_id,)
-                )
-                connection.execute("UPDATE planning_failures SET active=0 WHERE active=1")
+        enough_selections = len(selections) >= 5
+        if enough_selections:
+            connection.execute(
+                "UPDATE trading_round SET status='active' WHERE id=?", (round_id,)
+            )
+            connection.execute("UPDATE planning_failures SET active=0 WHERE active=1")
         if not enough_selections:
+            if (
+                qualified_candidates > 0
+                and fundable_candidates == 0
+                and unknown_fundability_candidates == 0
+            ):
+                raise UnfundablePlanningError(
+                    "all otherwise-qualified candidates are below minimum executable quantity"
+                )
             raise RoundPlanningError(
                 "round requires at least five markets with qualifying strategies"
             )

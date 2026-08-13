@@ -71,6 +71,49 @@ def test_binance_adapter_maps_public_data_and_records_fx_conversion_provenance()
     assert all("key" not in str(call).lower() for call in calls)
 
 
+def test_binance_adapter_parses_public_symbol_quantity_and_notional_rules() -> None:
+    def transport(url: str, params: dict[str, str]) -> object:
+        if url.endswith("/exchangeInfo"):
+            assert params == {"symbol": "BTCUSDT"}
+            return {
+            "symbols": [
+                {
+                    "symbol": "BTCUSDT",
+                    "quoteAsset": "USDC",
+                    "filters": [
+                        {
+                            "filterType": "LOT_SIZE",
+                            "minQty": "0.00001000",
+                            "stepSize": "0.00001000",
+                        },
+                        {"filterType": "NOTIONAL", "minNotional": "5.00"},
+                    ],
+                }
+            ]
+            }
+        return {"result": "success", "rates": {"TWD": "32"},
+                "time_last_update_unix": 1_767_225_600}
+
+    rules = BinanceMarketData(
+        transport=transport,
+        clock=lambda: datetime(2026, 1, 1, 0, 1, tzinfo=UTC),
+    ).market_rules("BTCUSDT")
+
+    assert rules.min_quantity == Decimal("0.00001000")
+    assert rules.step_size == Decimal("0.00001000")
+    assert rules.min_notional_ntd == Decimal("160.00")
+
+
+def test_binance_adapter_rejects_malformed_exchange_rules() -> None:
+    adapter = BinanceMarketData(
+        transport=lambda _url, _params: {
+            "symbols": [{"symbol": "BTCUSDT", "quoteAsset": "USDT", "filters": []}]
+        }
+    )
+    with pytest.raises(MarketDataError, match="rules"):
+        adapter.market_rules("BTCUSDT")
+
+
 def test_binance_adapter_rejects_malformed_or_out_of_order_data() -> None:
     adapter = BinanceMarketData(transport=lambda _url, _params: {"not": "a list"})
     with pytest.raises(MarketDataError, match="malformed Binance ticker"):

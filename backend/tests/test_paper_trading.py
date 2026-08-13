@@ -10,7 +10,13 @@ import pytest
 
 from backend.app.database import Database
 from backend.app.engine import RoundPlanningError, TradingEngine
-from backend.app.market_data import Candle, MarketDataError, MarketSummary, NtdConversion
+from backend.app.market_data import (
+    Candle,
+    MarketDataError,
+    MarketRules,
+    MarketSummary,
+    NtdConversion,
+)
 
 
 class ExecutionMarketData:
@@ -27,6 +33,15 @@ class ExecutionMarketData:
             "BTCUSDT": list(map(Decimal, range(30, 14, -1))),
             "ETHUSDT": list(map(Decimal, range(30, 14, -1))),
         }
+
+    def market_rules(self, symbol: str) -> MarketRules:
+        return MarketRules(
+            symbol,
+            Decimal("0.000001"),
+            Decimal("0.000001"),
+            Decimal("0.000001"),
+            "fixture",
+        )
 
     def market_summaries(self) -> list[MarketSummary]:
         return [
@@ -95,10 +110,15 @@ def active_engine(
     }
     frozen.update(settings or {})
     with database.connect() as connection, connection:
+        cycle = connection.execute(
+            "INSERT INTO cycles(status, started_at, starting_capital_ntd) "
+            "VALUES('active', ?, ?)",
+            (now.isoformat(), str(frozen["starting_capital_ntd"])),
+        )
         cursor = connection.execute(
             "INSERT INTO trading_round"
-            "(status, started_at, frozen_settings_json) VALUES('planning', ?, ?)",
-            (now.isoformat(), json.dumps(frozen)),
+            "(status, started_at, frozen_settings_json, cycle_id) VALUES('planning', ?, ?, ?)",
+            (now.isoformat(), json.dumps(frozen), cycle.lastrowid),
         )
         round_id = cursor.lastrowid
         assert round_id is not None

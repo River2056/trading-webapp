@@ -87,3 +87,20 @@ test('healthy dashboard still renders the latest recovered market-data incident'
   expect(screen.getByText(/3 retries/i)).toBeTruthy()
   expect(screen.getByText(/recovered 2026-01-01T00:03:00Z/i)).toBeTruthy()
 })
+
+test('running dashboard always renders latest bankruptcy reset history', async () => {
+  vi.spyOn(globalThis, 'fetch').mockImplementationOnce(() => jsonResponse({
+    product: 'Paper Trading Only', desired_state: 'running', operational_state: 'running',
+    run_status: 'running', round_status: 'active', completed_round_count: 4,
+    configured_capital_ntd: '5000.00', current_capital_ntd: '5000.00', engine_health: 'healthy',
+    cycle_count: 3, days_since_bankruptcy: 12,
+    bankruptcy: { reason: 'minimum notional unavailable', declared_at: '2026-01-01T00:00:00Z',
+      ending_equity_ntd: '4.50' }, planning_failure: null, market_data_incident: null,
+  })).mockImplementationOnce(() => jsonResponse({}))
+  render(App)
+
+  expect(await screen.findByText('Latest bankruptcy and reset')).toBeTruthy()
+  expect(screen.getByText('minimum notional unavailable')).toBeTruthy()
+  expect(screen.getByText(/cycle 3/i)).toBeTruthy()
+  expect(screen.getByText(/12 days since bankruptcy/i)).toBeTruthy()
+})
