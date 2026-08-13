@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import secrets
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -175,4 +176,4 @@ def create_app(database_path: Path | str = "data/paper-trading.sqlite3") -> Fast
     return app
 
 
-app = create_app()
+app = create_app(os.environ.get("TRADING_DATABASE_PATH", "data/paper-trading.sqlite3"))
