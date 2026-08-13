@@ -1,0 +1,8 @@
+{
+  "extends": "@vue/tsconfig/tsconfig.dom.json",
+  "include": ["src/**/*.ts", "src/**/*.vue", "tests/**/*.ts", "vite.config.ts"],
+  "compilerOptions": {
+    "strict": true,
+    "types": ["vitest/globals", "node"]
+  }
+}

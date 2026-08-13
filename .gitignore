@@ -11,3 +11,7 @@ coverage/
 *.sqlite
 *.sqlite3
 *.db
+data/
+frontend/.vite/
+frontend/test-results/
+frontend/playwright-report/
