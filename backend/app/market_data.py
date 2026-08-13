@@ -97,7 +97,6 @@ class BinanceMarketData:
         payload = self._transport(f"{self._base_url}/ticker/24hr", {})
         if not isinstance(payload, list):
             raise MarketDataError("malformed Binance ticker response")
-        observed_at = self._clock()
         summaries: list[MarketSummary] = []
         try:
             for item in payload:
@@ -119,11 +118,19 @@ class BinanceMarketData:
                         quote_asset=quote_asset,
                         last_price=Decimal(str(item["lastPrice"])),
                         quote_volume=Decimal(str(item["quoteVolume"])),
-                        observed_at=observed_at,
+                        observed_at=datetime.fromtimestamp(int(item["closeTime"]) / 1000, UTC),
                     )
                 )
-        except (KeyError, InvalidOperation, ValueError) as error:
+        except (KeyError, InvalidOperation, ValueError, TypeError) as error:
             raise MarketDataError("malformed Binance ticker response") from error
+        now = self._clock()
+        if any(
+            not item.last_price.is_finite()
+            or not item.quote_volume.is_finite()
+            or item.observed_at > now
+            for item in summaries
+        ):
+            raise MarketDataError("invalid or future Binance ticker data")
         return summaries
 
     def ntd_conversion(self, quote_asset: str) -> NtdConversion:
@@ -157,9 +164,13 @@ class BinanceMarketData:
         except (KeyError, InvalidOperation, ValueError, TypeError) as error:
             raise MarketDataError("malformed public conversion response") from error
         rate = stablecoin_rate * twd_rate
-        if rate <= 0:
+        if not all(value.is_finite() for value in (stablecoin_rate, twd_rate, rate)) or rate <= 0:
             raise MarketDataError("invalid public conversion rate")
         now = self._clock()
+        if stablecoin_observed_at > now:
+            raise MarketDataError("future stablecoin conversion leg")
+        if observed_at > now:
+            raise MarketDataError("future fx conversion leg")
         if now - stablecoin_observed_at > self._max_conversion_age:
             raise MarketDataError("stale stablecoin conversion leg")
         if now - observed_at > self._max_conversion_age:
@@ -199,7 +210,21 @@ class BinanceMarketData:
                 )
         except (InvalidOperation, ValueError, TypeError) as error:
             raise MarketDataError("malformed Binance candle response") from error
-        if len(candles) != limit or any(c.close <= 0 or c.volume < 0 for c in candles):
+        now = self._clock()
+        if any(c.opened_at > now for c in candles):
+            raise MarketDataError("future Binance candles")
+        if len(candles) != limit or any(
+            not all(value.is_finite() for value in (c.open, c.high, c.low, c.close, c.volume))
+            or c.open <= 0
+            or c.high <= 0
+            or c.low <= 0
+            or c.close <= 0
+            or c.volume < 0
+            or c.low > min(c.open, c.close)
+            or max(c.open, c.close) > c.high
+            or c.low > c.high
+            for c in candles
+        ):
             raise MarketDataError("invalid or incomplete Binance candles")
         ordered_pairs = zip(candles, candles[1:], strict=False)
         if any(left.opened_at >= right.opened_at for left, right in ordered_pairs):

@@ -55,6 +55,8 @@ class ExecutionMarketData:
         if symbol in self.candle_errors:
             raise MarketDataError(f"candles unavailable for {symbol}")
         values = self.histories[symbol]
+        if len(values) < limit:
+            values = [values[0]] * (limit - len(values)) + values
         start = self.now - timedelta(hours=len(values) - 1)
         return [
             Candle(start + timedelta(hours=index), value, value, value, value, Decimal("1000"))

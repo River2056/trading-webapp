@@ -68,6 +68,8 @@ def test_operator_can_configure_start_stop_and_observe_persisted_run(tmp_path: P
             "engine_health": "healthy",
             "health": "healthy",
             "health_detail": None,
+            "operational_state": "running",
+            "market_data_incident": None,
             "planning_failure": None,
         }
 

@@ -7,7 +7,16 @@ type Dashboard = {
   configured_capital_ntd: string
   current_capital_ntd: string
   engine_health: 'healthy' | 'degraded'
+  operational_state: 'running' | 'stopped' | 'degraded'
   planning_failure: { reason: string; occurred_at: string } | null
+  market_data_incident: {
+    cause: string
+    occurred_at: string
+    retry_count: number
+    next_retry_at: string | null
+    recovered_at: string | null
+    active: number
+  } | null
 }
 
 type RunSettings = {
@@ -70,8 +79,14 @@ async function authenticate(path: 'signup' | 'login') {
 }
 
 async function changeState(state: 'start' | 'stop') {
-  const result = await request<{ desired_state: 'running' | 'stopped' }>(`/api/run/${state}`, { method: 'POST' })
-  if (dashboard.value) dashboard.value.desired_state = result.desired_state
+  const result = await request<{
+    desired_state: 'running' | 'stopped'
+    operational_state: 'running' | 'stopped' | 'degraded'
+  }>(`/api/run/${state}`, { method: 'POST' })
+  if (dashboard.value) {
+    dashboard.value.desired_state = result.desired_state
+    dashboard.value.operational_state = result.operational_state
+  }
 }
 
 async function saveSettings() {
@@ -108,13 +123,26 @@ onMounted(loadDashboard)
         <span class="badge">No real orders</span>
       </header>
       <section class="card hero">
-        <div><p>Persisted run state</p><h2>{{ dashboard.desired_state === 'running' ? 'Running' : 'Stopped' }}</h2></div>
+        <div><p>Persisted run state</p><h2>{{ dashboard.operational_state === 'degraded' ? 'Paused — market data degraded' : dashboard.operational_state === 'running' ? 'Running' : 'Stopped' }}</h2></div>
         <button v-if="dashboard.desired_state === 'stopped'" @click="changeState('start')">Start run</button>
         <button v-else class="stop" @click="changeState('stop')">Stop run</button>
       </section>
       <section v-if="dashboard.engine_health === 'degraded'" class="card error" role="alert">
-        <strong>Planning health degraded</strong>
-        <p>{{ dashboard.planning_failure?.reason }}</p>
+        <strong>Execution paused</strong>
+        <p>{{ dashboard.market_data_incident?.cause || dashboard.planning_failure?.reason }}</p>
+        <p v-if="dashboard.market_data_incident">
+          Retry {{ dashboard.market_data_incident.retry_count }} · next attempt
+          {{ dashboard.market_data_incident.next_retry_at }}
+        </p>
+      </section>
+      <section v-else-if="dashboard.market_data_incident?.recovered_at" class="card incident-history">
+        <strong>Latest recovered market-data incident</strong>
+        <p>{{ dashboard.market_data_incident.cause }}</p>
+        <p>
+          Occurred {{ dashboard.market_data_incident.occurred_at }} ·
+          {{ dashboard.market_data_incident.retry_count }} retries ·
+          recovered {{ dashboard.market_data_incident.recovered_at }}
+        </p>
       </section>
       <section class="metrics">
         <article class="card"><p>Configured capital</p><strong>{{ Number(dashboard.configured_capital_ntd).toLocaleString('en-US', { style: 'currency', currency: 'TWD' }) }}</strong></article>

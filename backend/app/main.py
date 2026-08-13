@@ -4,7 +4,9 @@ import hashlib
 import os
 import secrets
 import sqlite3
-from collections.abc import Callable
+import threading
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -17,6 +19,7 @@ from .database import Database, utc_now
 from .engine import RoundPlanningError, RoundPlanningSettings, TradingEngine
 from .market_data import BinanceMarketData, MarketData
 from .schemas import PasswordInput, RunSettings
+from .worker import TradingWorker
 
 SESSION_COOKIE = "paper_session"
 _password_hash = PasswordHash.recommended()
@@ -57,17 +60,36 @@ def create_app(
     database_path: Path | str = "data/paper-trading.sqlite3",
     market_data: MarketData | None = None,
     clock: Callable[[], datetime] | None = None,
+    start_worker: bool | None = None,
 ) -> FastAPI:
     database = Database(Path(database_path))
     database.migrate()
     database.ensure_defaults()
-    app = FastAPI(title="Paper Trading Only", version="0.1.0")
-    app.state.database = database
     planning_clock = clock or (lambda: datetime.now(UTC))
     engine = TradingEngine(
         database, market_data or BinanceMarketData(clock=planning_clock), planning_clock
     )
+    worker = TradingWorker(database, engine, planning_clock)
+    should_start_worker = market_data is None if start_worker is None else start_worker
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        worker_thread: threading.Thread | None = None
+        if should_start_worker:
+            worker_thread = threading.Thread(
+                target=worker.run_forever, name="paper-trading-worker"
+            )
+            worker_thread.start()
+        yield
+        if should_start_worker:
+            worker.stop()
+            if worker_thread is not None:
+                worker_thread.join()
+
+    app = FastAPI(title="Paper Trading Only", version="0.1.0", lifespan=lifespan)
+    app.state.database = database
     app.state.engine = engine
+    app.state.worker = worker
 
     def authenticated(
         paper_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
@@ -159,11 +181,23 @@ def create_app(
 
     def change_state(desired_state: RunState) -> dict[str, str]:
         with database.connect() as connection, connection:
-            connection.execute(
-                "UPDATE trading_run SET desired_state=?, updated_at=? WHERE id=1",
-                (desired_state.value, utc_now()),
+            active_incident = connection.execute(
+                "SELECT 1 FROM market_data_incidents WHERE active=1 LIMIT 1"
+            ).fetchone()
+            operational_state = (
+                "degraded"
+                if desired_state is RunState.RUNNING and active_incident is not None
+                else desired_state.value
             )
-        return {"desired_state": desired_state.value}
+            connection.execute(
+                "UPDATE trading_run SET desired_state=?, operational_state=?, "
+                "updated_at=? WHERE id=1",
+                (desired_state.value, operational_state, utc_now()),
+            )
+        return {
+            "desired_state": desired_state.value,
+            "operational_state": operational_state,
+        }
 
     @app.post("/api/run/start", dependencies=[Depends(authenticated)])
     def start() -> dict[str, object]:
@@ -176,9 +210,9 @@ def create_app(
                     "SELECT symbol FROM round_selections WHERE round_id=? ORDER BY selection_rank",
                     (active["id"],),
                 ).fetchall()
-                change_state(RunState.RUNNING)
+                state = change_state(RunState.RUNNING)
                 return {
-                    "desired_state": RunState.RUNNING.value,
+                    **state,
                     "round_id": active["id"],
                     "selections": [selection["symbol"] for selection in selections],
                 }
@@ -190,9 +224,9 @@ def create_app(
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, f"round planning failed: {error}"
             ) from error
-        change_state(RunState.RUNNING)
+        state = change_state(RunState.RUNNING)
         return {
-            "desired_state": RunState.RUNNING.value,
+            **state,
             "round_id": plan.round_id,
             "selections": [selection.symbol for selection in plan.selections],
         }
@@ -205,7 +239,8 @@ def create_app(
     def dashboard() -> dict[str, object]:
         with database.connect() as connection:
             row = connection.execute(
-                """SELECT desired_state, current_capital_ntd, starting_capital_ntd
+                """SELECT desired_state, operational_state, current_capital_ntd,
+                starting_capital_ntd
                 FROM trading_run JOIN run_settings ON run_settings.id = trading_run.id
                 WHERE trading_run.id = 1"""
             ).fetchone()
@@ -213,7 +248,14 @@ def create_app(
                 "SELECT round_id, occurred_at, reason, active FROM planning_failures "
                 "WHERE active=1 ORDER BY id DESC LIMIT 1"
             ).fetchone()
-        health = "degraded" if failure else "healthy"
+            incident = connection.execute(
+                """SELECT round_id, cause, occurred_at, retry_count, next_retry_at,
+                recovered_at, active FROM market_data_incidents
+                ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+        active_incident = incident is not None and bool(incident["active"])
+        health = "degraded" if failure or active_incident else "healthy"
+        detail = incident["cause"] if active_incident else failure["reason"] if failure else None
         return {
             "product": "Paper Trading Only",
             "desired_state": row["desired_state"],
@@ -221,7 +263,9 @@ def create_app(
             "current_capital_ntd": f"{float(row['current_capital_ntd']):.2f}",
             "engine_health": health,
             "health": health,
-            "health_detail": failure["reason"] if failure else None,
+            "health_detail": detail,
+            "operational_state": row["operational_state"],
+            "market_data_incident": dict(incident) if incident else None,
             "planning_failure": (
                 {
                     "active": True,

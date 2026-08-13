@@ -17,6 +17,10 @@ class RoundPlanningError(RuntimeError):
     pass
 
 
+class MarketDataSafetyError(RuntimeError):
+    """Required execution data was unsafe; the enclosing transaction must roll back."""
+
+
 @dataclass(frozen=True)
 class RoundPlanningSettings:
     candle_interval: str
@@ -340,18 +344,44 @@ def _strategy_from_record(version: str, configuration_json: str) -> Strategy:
 
 class TradingEngine:
     def __init__(
-        self, database: Database, market_data: MarketData, clock: Callable[[], datetime]
+        self,
+        database: Database,
+        market_data: MarketData,
+        clock: Callable[[], datetime],
+        fault_injector: Callable[[str], None] | None = None,
     ) -> None:
         self.database = database
         self.market_data = market_data
         self.clock = clock
+        self.fault_injector = fault_injector
         self.last_exclusions: dict[str, str] = {}
 
-    def evaluate_active_round(self) -> EvaluationResult:
+    def evaluate_active_round(
+        self,
+        *,
+        require_safe_data: bool = False,
+        connection: sqlite3.Connection | None = None,
+        completion_hook: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> EvaluationResult:
         now = self.clock()
         if now.tzinfo is None:
             now = now.replace(tzinfo=UTC)
-        with self.database.connect() as connection, connection:
+        if connection is None:
+            with self.database.connect() as owned_connection, owned_connection:
+                return self._evaluate_active_round_in_transaction(
+                    owned_connection, now, require_safe_data, completion_hook
+                )
+        return self._evaluate_active_round_in_transaction(
+            connection, now, require_safe_data, completion_hook
+        )
+
+    def _evaluate_active_round_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        now: datetime,
+        require_safe_data: bool,
+        completion_hook: Callable[[sqlite3.Connection], None] | None,
+    ) -> EvaluationResult:
             run_row = connection.execute(
                 "SELECT desired_state FROM trading_run ORDER BY id LIMIT 1"
             ).fetchone()
@@ -377,6 +407,8 @@ class TradingEngine:
                     "SELECT * FROM portfolio_snapshots WHERE round_id=? AND interval_key=?",
                     (round_id, interval_key),
                 ).fetchone()
+                if completion_hook is not None:
+                    completion_hook(connection)
                 return EvaluationResult(
                     (),
                     PortfolioAccount(
@@ -405,6 +437,7 @@ class TradingEngine:
             current_prices: dict[str, Decimal] = {}
             validated_prices: dict[str, _ValidatedPrice] = {}
             prepared: list[_PreparedDecision] = []
+            unsafe_reasons: list[str] = []
 
             # Phase one: collect and validate all valuations before any fill can be sized.
             for selection in selections:
@@ -412,6 +445,7 @@ class TradingEngine:
                 strategy_version = str(selection["strategy_version"])
                 summary = summaries.get(symbol)
                 if summary is None:
+                    unsafe_reasons.append(f"{symbol}: market summary unavailable")
                     decisions.append(
                         self._persist_rejection(
                             connection,
@@ -433,6 +467,7 @@ class TradingEngine:
                 try:
                     conversion = self.market_data.ntd_conversion(summary.quote_asset)
                 except MarketDataError as error:
+                    unsafe_reasons.append(f"{symbol}: {error}")
                     decisions.append(
                         self._persist_rejection(
                             connection,
@@ -465,7 +500,23 @@ class TradingEngine:
                 }
                 reason: str | None = None
                 rejected_timestamp = source_timestamp
-                if price_ntd <= 0:
+                if not all(
+                    value.is_finite()
+                    for value in (
+                        summary.last_price,
+                        summary.quote_volume,
+                        conversion.rate,
+                        price_ntd,
+                    )
+                ):
+                    reason = "market price or conversion rate is not finite"
+                elif summary.observed_at > now:
+                    reason = "market price timestamp is in the future"
+                    rejected_timestamp = summary.observed_at
+                elif conversion.observed_at > now:
+                    reason = "NTD conversion timestamp is in the future"
+                    rejected_timestamp = conversion.observed_at
+                elif price_ntd <= 0:
                     reason = "market price or conversion rate is not positive"
                 elif (now - summary.observed_at).total_seconds() > int(
                     settings.get("max_candle_age_seconds", 7200)
@@ -478,6 +529,7 @@ class TradingEngine:
                     reason = "NTD conversion is stale"
                     rejected_timestamp = conversion.observed_at
                 if reason is not None:
+                    unsafe_reasons.append(f"{symbol}: {reason}")
                     decisions.append(
                         self._persist_rejection(
                             connection,
@@ -507,14 +559,16 @@ class TradingEngine:
                 price_ntd = validated.price_ntd
                 source_timestamp = validated.source_timestamp
                 evidence = dict(validated.evidence)
+                requested_candle_count = int(settings["backtest_lookback_candles"])
                 try:
                     candles = self.market_data.historical_candles(
                         symbol,
                         str(settings["candle_interval"]),
-                        int(settings["backtest_lookback_candles"]),
+                        requested_candle_count,
                     )
                 except MarketDataError as error:
                     evidence["market_data_error"] = str(error)
+                    unsafe_reasons.append(f"{symbol}: {error}")
                     decisions.append(
                         self._persist_rejection(
                             connection,
@@ -530,7 +584,12 @@ class TradingEngine:
                         )
                     )
                     continue
-                if not candles:
+                if len(candles) != requested_candle_count:
+                    reason = (
+                        "incomplete required candles: "
+                        f"expected {requested_candle_count}, received {len(candles)}"
+                    )
+                    unsafe_reasons.append(f"{symbol}: {reason}")
                     decisions.append(
                         self._persist_rejection(
                             connection,
@@ -541,15 +600,93 @@ class TradingEngine:
                             source_timestamp,
                             strategy_version,
                             "hold",
-                            "signal candles unavailable",
+                            reason,
                             evidence,
                         )
                     )
                     continue
                 candle_timestamp = candles[-1].opened_at
+                if any(
+                    left.opened_at >= right.opened_at
+                    for left, right in zip(candles, candles[1:], strict=False)
+                ):
+                    reason = "out-of-order required candles"
+                    unsafe_reasons.append(f"{symbol}: {reason}")
+                    decisions.append(
+                        self._persist_rejection(
+                            connection,
+                            round_id,
+                            symbol,
+                            interval_key,
+                            now,
+                            candle_timestamp,
+                            strategy_version,
+                            "hold",
+                            reason,
+                            evidence,
+                        )
+                    )
+                    continue
+                if any(
+                    not all(
+                        value.is_finite()
+                        for value in (
+                            candle.open,
+                            candle.high,
+                            candle.low,
+                            candle.close,
+                            candle.volume,
+                        )
+                    )
+                    or candle.close <= 0
+                    or candle.open <= 0
+                    or candle.high <= 0
+                    or candle.low <= 0
+                    or candle.volume < 0
+                    or candle.low > min(candle.open, candle.close)
+                    or max(candle.open, candle.close) > candle.high
+                    or candle.low > candle.high
+                    for candle in candles
+                ):
+                    reason = "malformed required candles"
+                    unsafe_reasons.append(f"{symbol}: {reason}")
+                    decisions.append(
+                        self._persist_rejection(
+                            connection,
+                            round_id,
+                            symbol,
+                            interval_key,
+                            now,
+                            candle_timestamp,
+                            strategy_version,
+                            "hold",
+                            reason,
+                            evidence,
+                        )
+                    )
+                    continue
+                if candle_timestamp > now:
+                    reason = "required candle timestamp is in the future"
+                    unsafe_reasons.append(f"{symbol}: {reason}")
+                    decisions.append(
+                        self._persist_rejection(
+                            connection,
+                            round_id,
+                            symbol,
+                            interval_key,
+                            now,
+                            candle_timestamp,
+                            strategy_version,
+                            "hold",
+                            reason,
+                            evidence,
+                        )
+                    )
+                    continue
                 if (now - candle_timestamp).total_seconds() > int(
                     settings.get("max_candle_age_seconds", 7200)
                 ):
+                    unsafe_reasons.append(f"{symbol}: signal candles are stale")
                     decisions.append(
                         self._persist_rejection(
                             connection,
@@ -603,6 +740,11 @@ class TradingEngine:
                     )
                 )
 
+            # Required data is all-or-nothing: transaction rollback removes every
+            # rejection/fill prepared in this interval before the worker records pause.
+            if require_safe_data and unsafe_reasons:
+                raise MarketDataSafetyError("; ".join(unsafe_reasons))
+
             # Realize every same-cadence exit before applying entry risk limits. Stable
             # partitioning preserves selection order within each execution class.
             for item in sorted(prepared, key=lambda item: item.action != "sell"):
@@ -641,6 +783,8 @@ class TradingEngine:
                     _decimal_text(account.total_equity_ntd),
                 ),
             )
+            if completion_hook is not None:
+                completion_hook(connection)
             return EvaluationResult(tuple(decisions), account)
 
     def _execute_decision(
@@ -709,6 +853,8 @@ class TradingEngine:
                 _json(evidence),
             ),
         )
+        if self.fault_injector is not None:
+            self.fault_injector("after_signal_insert")
         if outcome == "filled":
             self._fill(
                 connection,
@@ -967,25 +1113,33 @@ class TradingEngine:
         ranked: list[tuple[MarketSummary, NtdConversion, Decimal]] = []
         minimum = settings.minimum_liquidity_ntd
         for summary in summaries:
-            if summary.last_price <= 0:
+            if not summary.last_price.is_finite() or summary.last_price <= 0:
                 self.last_exclusions[summary.symbol] = "invalid price: must be positive"
                 continue
-            if summary.quote_volume < 0:
+            if not summary.quote_volume.is_finite() or summary.quote_volume < 0:
                 self.last_exclusions[summary.symbol] = "invalid quote volume: must not be negative"
+                continue
+            if summary.observed_at > self.clock():
+                self.last_exclusions[summary.symbol] = "future market summary timestamp"
                 continue
             try:
                 conversion = self.market_data.ntd_conversion(summary.quote_asset)
             except MarketDataError as error:
                 self.last_exclusions[summary.symbol] = str(error)
                 continue
-            if conversion.rate <= 0:
+            if not conversion.rate.is_finite() or conversion.rate <= 0:
                 self.last_exclusions[summary.symbol] = "invalid NTD conversion rate"
+                continue
+            if conversion.observed_at > self.clock():
+                self.last_exclusions[summary.symbol] = "future NTD conversion timestamp"
                 continue
             if conversion.provenance is None:
                 self.last_exclusions[summary.symbol] = "missing structured conversion provenance"
                 continue
             if any(
-                (self.clock() - leg.observed_at).total_seconds()
+                not leg.rate.is_finite()
+                or leg.observed_at > self.clock()
+                or (self.clock() - leg.observed_at).total_seconds()
                 > settings.max_conversion_age_seconds
                 for leg in (conversion.provenance.stablecoin, conversion.provenance.fx)
             ):
@@ -1043,8 +1197,25 @@ class TradingEngine:
                         summary.symbol, interval, lookback
                     )
                     candle_age = (self.clock() - candles[-1].opened_at).total_seconds()
+                    if candle_age < 0:
+                        raise MarketDataError("future candidate candles")
                     if candle_age > settings.max_candle_age_seconds:
                         raise MarketDataError("stale candidate candles")
+                    if any(
+                        candle.opened_at > self.clock()
+                        or not all(
+                            value.is_finite()
+                            for value in (
+                                candle.open,
+                                candle.high,
+                                candle.low,
+                                candle.close,
+                                candle.volume,
+                            )
+                        )
+                        for candle in candles
+                    ):
+                        raise MarketDataError("invalid candidate candles")
                     results = [backtester.run(strategy, candles) for strategy in strategies]
                 except (MarketDataError, RoundPlanningError, ValueError, IndexError) as error:
                     self.last_exclusions[summary.symbol] = str(error)

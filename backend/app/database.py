@@ -61,6 +61,8 @@ class Database:
                 (now,),
             )
             connection.execute(
-                "INSERT OR IGNORE INTO trading_run VALUES (1, 'stopped', '5000.00', ?)",
+                "INSERT OR IGNORE INTO trading_run"
+                "(id, desired_state, current_capital_ntd, updated_at) "
+                "VALUES (1, 'stopped', '5000.00', ?)",
                 (now,),
             )

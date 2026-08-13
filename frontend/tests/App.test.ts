@@ -1,10 +1,15 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/vue'
-import { expect, test, vi } from 'vitest'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/vue'
+import { afterEach, expect, test, vi } from 'vitest'
 
 import App from '../src/App.vue'
 
 const jsonResponse = (body: object, status = 200) =>
   Promise.resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }))
+
+afterEach(() => {
+  cleanup()
+  vi.restoreAllMocks()
+})
 
 test('operator signs up and starts then stops the paper-trading run', async () => {
   const fetchMock = vi.spyOn(globalThis, 'fetch')
@@ -22,8 +27,8 @@ test('operator signs up and starts then stops the paper-trading run', async () =
       daily_loss_limit_pct: '3.00', fee_pct: '0.10', slippage_pct: '0.10',
     }))
     .mockImplementationOnce(() => jsonResponse({ starting_capital_ntd: '6000.00' }))
-    .mockImplementationOnce(() => jsonResponse({ desired_state: 'running' }))
-    .mockImplementationOnce(() => jsonResponse({ desired_state: 'stopped' }))
+    .mockImplementationOnce(() => jsonResponse({ desired_state: 'running', operational_state: 'running' }))
+    .mockImplementationOnce(() => jsonResponse({ desired_state: 'stopped', operational_state: 'stopped' }))
 
   render(App)
   await screen.findByRole('heading', { name: 'Local operator access' })
@@ -51,4 +56,34 @@ test('operator signs up and starts then stops the paper-trading run', async () =
   await screen.findByText('Running')
   await fireEvent.click(screen.getByRole('button', { name: 'Stop run' }))
   await waitFor(() => expect(screen.getByText('Stopped')).toBeTruthy())
+})
+
+test('degraded operational state is visibly paused with an execution alert', async () => {
+  vi.spyOn(globalThis, 'fetch').mockImplementationOnce(() => jsonResponse({
+    product: 'Paper Trading Only', desired_state: 'running', operational_state: 'degraded',
+    configured_capital_ntd: '5000.00', current_capital_ntd: '5000.00', engine_health: 'degraded',
+    planning_failure: null, market_data_incident: { cause: 'stale ticker', retry_count: 2,
+      next_retry_at: '2026-01-01T00:01:00Z', recovered_at: null, active: 1 },
+  }))
+  render(App)
+  expect(await screen.findByText('Paused — market data degraded')).toBeTruthy()
+  expect(screen.getByText('Execution paused')).toBeTruthy()
+  expect(screen.queryByText('Running')).toBeNull()
+})
+
+test('healthy dashboard still renders the latest recovered market-data incident', async () => {
+  vi.spyOn(globalThis, 'fetch').mockImplementationOnce(() => jsonResponse({
+    product: 'Paper Trading Only', desired_state: 'running', operational_state: 'running',
+    configured_capital_ntd: '5000.00', current_capital_ntd: '5000.00', engine_health: 'healthy',
+    planning_failure: null, market_data_incident: { cause: 'stale ticker',
+      occurred_at: '2026-01-01T00:00:00Z', retry_count: 3, next_retry_at: null,
+      recovered_at: '2026-01-01T00:03:00Z', active: 0 },
+  })).mockImplementationOnce(() => jsonResponse({}))
+  render(App)
+
+  expect(await screen.findByText('Latest recovered market-data incident')).toBeTruthy()
+  expect(screen.getByText('stale ticker')).toBeTruthy()
+  expect(screen.getByText(/occurred 2026-01-01T00:00:00Z/i)).toBeTruthy()
+  expect(screen.getByText(/3 retries/i)).toBeTruthy()
+  expect(screen.getByText(/recovered 2026-01-01T00:03:00Z/i)).toBeTruthy()
 })
