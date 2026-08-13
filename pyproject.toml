@@ -21,7 +21,13 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["backend/app"]
+packages = ["backend"]
+
+[tool.hatch.build]
+include = [
+  "backend/**/*.py",
+  "backend/migrations/*.sql",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["backend/tests"]

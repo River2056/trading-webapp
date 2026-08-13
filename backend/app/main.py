@@ -81,6 +81,7 @@ def create_app(
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         worker_thread: threading.Thread | None = None
         if should_start_worker:
+            worker.prepare()
             worker_thread = threading.Thread(
                 target=worker.run_forever, name="paper-trading-worker"
             )
@@ -518,7 +519,7 @@ def create_app(
                 "FROM transition_planning_failures WHERE active=1 ORDER BY occurred_at DESC LIMIT 1"
             ).fetchone()
             incident = connection.execute(
-                """SELECT round_id, cause, occurred_at, retry_count, next_retry_at,
+                """SELECT round_id, cause, incident_kind, occurred_at, retry_count, next_retry_at,
                 recovered_at, active FROM market_data_incidents
                 ORDER BY id DESC LIMIT 1"""
             ).fetchone()

@@ -59,6 +59,11 @@ class TradingWorker:
         self.base_backoff_seconds = base_backoff_seconds
         self.max_backoff_seconds = max_backoff_seconds
         self.fault_injector = fault_injector
+        self.pending_database_lock: tuple[str, datetime] | None = None
+
+    def prepare(self) -> None:
+        """Prepare a new run before its thread starts, so a later stop cannot be lost."""
+        self._stop.clear()
 
     def step(self) -> WorkerResult:
         now = self._now()
@@ -219,11 +224,14 @@ class TradingWorker:
                 raise
 
     def run_forever(self, poll_seconds: float = 1, *, max_steps: int | None = None) -> None:
-        self._stop.clear()
         steps = 0
         while not self._stop.is_set() and (max_steps is None or steps < max_steps):
             try:
-                result = self.step()
+                result = (
+                    self._persist_pending_database_lock()
+                    if self.pending_database_lock is not None
+                    else self.step()
+                )
             except sqlite3.OperationalError as error:
                 if "locked" not in str(error).lower() and "busy" not in str(error).lower():
                     raise
@@ -232,9 +240,27 @@ class TradingWorker:
                     poll_seconds,
                     exc_info=error,
                 )
+                if self.pending_database_lock is None:
+                    self.pending_database_lock = (str(error), self._now())
                 result = WorkerResult("backoff", poll_seconds)
             steps += 1
             self.sleeper(max(poll_seconds, result.retry_after_seconds))
+
+    def _persist_pending_database_lock(self) -> WorkerResult:
+        pending = self.pending_database_lock
+        if pending is None:
+            return WorkerResult("advanced")
+        cause, now = pending
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                result = self._degrade(connection, cause, now, incident_kind="database_lock")
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        self.pending_database_lock = None
+        return result
 
     def stop(self) -> None:
         self._stop.set()
@@ -253,7 +279,8 @@ class TradingWorker:
         return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
     def _degrade(
-        self, connection: sqlite3.Connection, cause: str, now: datetime
+        self, connection: sqlite3.Connection, cause: str, now: datetime,
+        *, incident_kind: str = "market_data",
     ) -> WorkerResult:
         timestamp = self._timestamp(now)
         active = connection.execute(
@@ -277,9 +304,10 @@ class TradingWorker:
             ).fetchone()
             connection.execute(
                 "INSERT INTO market_data_incidents"
-                "(round_id, cause, occurred_at, retry_count, next_retry_at) "
-                "VALUES(?, ?, ?, ?, ?)",
-                (round_row["id"] if round_row else None, cause, timestamp, retry_count, next_retry),
+                "(round_id, cause, occurred_at, retry_count, next_retry_at, incident_kind) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                (round_row["id"] if round_row else None, cause, timestamp, retry_count,
+                 next_retry, incident_kind),
             )
         connection.execute(
             "UPDATE trading_run SET operational_state='degraded', updated_at=? WHERE id=1",

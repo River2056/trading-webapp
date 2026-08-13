@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -445,6 +445,37 @@ def test_lifespan_waits_for_inflight_worker_and_exits_with_thread_dead(tmp_path:
     )
 
 
+def test_lifespan_stop_before_worker_run_entry_is_not_lost(tmp_path: Path) -> None:
+    """Shutdown may win after Thread.start but before run_forever begins executing."""
+    data = FixtureMarketData()
+    app = create_app(
+        tmp_path / "stop-before-entry.sqlite3",
+        market_data=data,
+        clock=lambda: data.observed_at,
+        start_worker=True,
+    )
+    may_enter = threading.Event()
+    entered = threading.Event()
+    original = app.state.worker.run_forever
+
+    def delayed_entry() -> None:
+        assert may_enter.wait(3)
+        entered.set()
+        original(max_steps=1)
+
+    app.state.worker.run_forever = delayed_entry
+    app.state.worker.prepare()
+    worker_thread = threading.Thread(target=delayed_entry, name="paper-trading-worker")
+    worker_thread.start()
+    app.state.worker.stop()
+    may_enter.set()
+    worker_thread.join(3)
+
+    assert entered.is_set()
+    assert not worker_thread.is_alive()
+    assert rows(app.state.database, "SELECT * FROM worker_checkpoint") == []
+
+
 def test_stop_wins_when_it_races_initial_round_activation(tmp_path: Path) -> None:
     data = FixtureMarketData()
     app = create_app(
@@ -491,6 +522,7 @@ def test_stop_wins_when_it_races_initial_round_activation(tmp_path: Path) -> Non
 def test_worker_retries_sqlite_busy_without_dying(caplog: pytest.LogCaptureFixture) -> None:
     worker = object.__new__(TradingWorker)
     worker._stop = threading.Event()
+    worker.clock = lambda: datetime(2026, 1, 1, tzinfo=UTC)
     attempts = 0
     waits: list[float] = []
 
@@ -503,9 +535,53 @@ def test_worker_retries_sqlite_busy_without_dying(caplog: pytest.LogCaptureFixtu
         return WorkerResult("advanced")
 
     worker.step = step
+    worker.pending_database_lock = None
+
+    def persist() -> WorkerResult:
+        worker.pending_database_lock = None
+        return WorkerResult("degraded", 0.25)
+
+    worker._persist_pending_database_lock = persist
     worker.sleeper = waits.append
     worker.run_forever(poll_seconds=0.25)
 
     assert attempts == 2
-    assert waits == [0.25, 0.25]
+    assert waits == [0.25, 0.25, 0.25]
     assert "SQLite is busy" in caplog.text
+
+
+def test_real_sqlite_lock_is_persisted_then_recovers_before_work_advances(tmp_path: Path) -> None:
+    engine, database, data = active_engine(tmp_path)
+    database.timeout_seconds = 0.01
+    worker = TradingWorker(database, engine, lambda: data.now, sleeper=lambda _: None)
+    lock = sqlite3.connect(database.path, timeout=0.01)
+    lock.execute("BEGIN IMMEDIATE")
+
+    worker.run_forever(poll_seconds=0.01, max_steps=1)
+    assert worker.pending_database_lock is not None
+    lock.rollback()
+    lock.close()
+
+    worker.run_forever(poll_seconds=0.01, max_steps=1)
+    incident = rows(database, "SELECT * FROM market_data_incidents WHERE active=1")[0]
+    assert incident["incident_kind"] == "database_lock"
+    assert rows(database, "SELECT outcome FROM worker_checkpoint")[0]["outcome"] == "degraded"
+    assert rows(database, "SELECT * FROM paper_trades") == []
+
+    data.now += timedelta(seconds=1)
+    worker.run_forever(poll_seconds=0.01, max_steps=1)
+    recovered = rows(database, "SELECT * FROM market_data_incidents")[0]
+    assert recovered["active"] == 0
+    assert recovered["recovered_at"] is not None
+    assert rows(database, "SELECT outcome FROM worker_checkpoint")[0]["outcome"] == "advanced"
+    assert rows(database, "SELECT * FROM paper_trades")
+
+
+def test_unrelated_sqlite_operational_error_is_not_retried() -> None:
+    worker = object.__new__(TradingWorker)
+    worker._stop = threading.Event()
+    worker.pending_database_lock = None
+    worker.sleeper = lambda _: None
+    worker.step = lambda: (_ for _ in ()).throw(sqlite3.OperationalError("no such table"))
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        worker.run_forever(max_steps=1)

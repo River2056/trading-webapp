@@ -14,12 +14,13 @@ def utc_now() -> str:
 
 
 class Database:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, timeout_seconds: float = 5.0) -> None:
         self.path = path
+        self.timeout_seconds = timeout_seconds
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=self.timeout_seconds)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         try:
