@@ -75,6 +75,54 @@ def test_required_data_failure_atomically_pauses_before_any_trade(
     assert run["operational_state"] == "degraded"
 
 
+@pytest.mark.parametrize(
+    ("first_kind", "first_cause", "second_kind", "second_cause"),
+    [
+        ("market_data", "provider unavailable", "database_lock", "database is locked"),
+        ("database_lock", "database is locked", "market_data", "provider unavailable"),
+    ],
+)
+def test_failure_class_change_closes_typed_incident_and_starts_new_history(
+    tmp_path: Path,
+    first_kind: str,
+    first_cause: str,
+    second_kind: str,
+    second_cause: str,
+) -> None:
+    engine, database, data = active_engine(tmp_path)
+    worker = TradingWorker(database, engine, lambda: data.now)
+
+    with database.connect() as connection, connection:
+        worker._degrade(connection, first_cause, data.now, incident_kind=first_kind)
+        data.now += timedelta(seconds=1)
+        worker._degrade(connection, second_cause, data.now, incident_kind=second_kind)
+
+    incidents = rows(database, "SELECT * FROM market_data_incidents ORDER BY id")
+    assert len(incidents) == 2
+    previous, current = incidents
+    assert (previous["incident_kind"], previous["cause"], previous["active"]) == (
+        first_kind,
+        first_cause,
+        0,
+    )
+    assert previous["recovered_at"] == worker._timestamp(data.now)
+    assert (current["incident_kind"], current["cause"], current["active"]) == (
+        second_kind,
+        second_cause,
+        1,
+    )
+    assert current["retry_count"] == 1
+    assert current["next_retry_at"] == worker._timestamp(data.now + timedelta(seconds=1))
+
+    app = create_app(database.path, market_data=data, clock=lambda: data.now, start_worker=False)
+    with TestClient(app) as client:
+        client.post("/api/auth/signup", json={"password": "correct horse battery staple"})
+        projected = client.get("/api/dashboard").json()["market_data_incident"]
+    assert projected["incident_kind"] == second_kind
+    assert projected["cause"] == second_cause
+    assert projected["retry_count"] == 1
+
+
 def test_retries_are_bounded_and_recovery_requires_fresh_data(tmp_path: Path) -> None:
     engine, database, data = active_engine(tmp_path)
     data.now += timedelta(hours=1)

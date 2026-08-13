@@ -28,6 +28,9 @@ include = [
   "backend/**/*.py",
   "backend/migrations/*.sql",
 ]
+exclude = [
+  "backend/tests/**",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["backend/tests"]

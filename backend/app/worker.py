@@ -284,8 +284,15 @@ class TradingWorker:
     ) -> WorkerResult:
         timestamp = self._timestamp(now)
         active = connection.execute(
-            "SELECT id, retry_count FROM market_data_incidents WHERE active=1"
+            "SELECT id, retry_count, incident_kind FROM market_data_incidents WHERE active=1"
         ).fetchone()
+        if active is not None and active["incident_kind"] != incident_kind:
+            connection.execute(
+                "UPDATE market_data_incidents SET active=0, recovered_at=?, next_retry_at=NULL "
+                "WHERE id=?",
+                (timestamp, active["id"]),
+            )
+            active = None
         retry_count = int(active["retry_count"]) + 1 if active else 1
         delay = min(
             self.max_backoff_seconds,

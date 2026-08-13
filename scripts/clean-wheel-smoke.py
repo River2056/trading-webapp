@@ -5,6 +5,17 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from zipfile import ZipFile
+
+
+def assert_production_wheel_boundary(wheel: Path) -> None:
+    with ZipFile(wheel) as archive:
+        names = archive.namelist()
+    forbidden = ("backend/tests/", "e2e_app", "__e2e__")
+    leaked = [name for name in names if any(marker in name for marker in forbidden)]
+    assert not leaked, f"wheel contains test-only files: {leaked}"
+    assert "backend/app/main.py" in names
+    assert "backend/migrations/001_bootstrap.sql" in names
 
 
 def main() -> None:
@@ -13,6 +24,7 @@ def main() -> None:
     wheel = Path(sys.argv[1]).resolve()
     if not wheel.is_file():
         raise SystemExit(f"wheel not found: {wheel}")
+    assert_production_wheel_boundary(wheel)
     with tempfile.TemporaryDirectory(prefix="paper-trading-wheel-") as temporary:
         root = Path(temporary)
         environment = root / "venv"
