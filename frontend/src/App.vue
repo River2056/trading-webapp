@@ -28,6 +28,7 @@ type Dashboard = {
   bankruptcy?: { reason: string; declared_at: string; ending_equity_ntd: string } | null
   planning_failure: { reason: string; occurred_at: string } | null
   market_data_incident: {
+    incident_kind: 'market_data' | 'database_lock'
     cause: string
     occurred_at: string
     retry_count: number
@@ -85,6 +86,7 @@ const resourceError = ref({ charts: '', trades: '', rounds: '', cycles: '' })
 const safeJson = (value: unknown) => { if (typeof value !== 'string') return value; try { return JSON.parse(value) } catch { return value } }
 const auditValue = (value: unknown) => typeof safeJson(value) === 'object' ? JSON.stringify(safeJson(value), null, 2) : String(safeJson(value) ?? '—')
 const label = (value: string) => value.replace(/_/g, ' ')
+const isDatabaseContention = () => dashboard.value?.market_data_incident?.incident_kind === 'database_lock'
 
 const money = (value: string | undefined) => Number(value || 0).toLocaleString('en-US', { style: 'currency', currency: 'TWD' })
 const signedPct = (value: string | undefined) => `${Number(value || 0) > 0 ? '+' : ''}${Number(value || 0).toFixed(2)}%`
@@ -217,7 +219,7 @@ onMounted(loadDashboard)
         <span class="badge">No real orders</span>
       </header>
       <section class="card hero">
-        <div><p>Persisted run state</p><h2>{{ dashboard.operational_state === 'degraded' ? 'Paused — market data degraded' : dashboard.operational_state === 'running' ? 'Running' : 'Stopped' }}</h2></div>
+        <div><p>Persisted run state</p><h2>{{ dashboard.operational_state === 'degraded' ? (isDatabaseContention() ? 'Paused — database contention' : 'Paused — market data degraded') : dashboard.operational_state === 'running' ? 'Running' : 'Stopped' }}</h2></div>
         <button v-if="dashboard.desired_state === 'stopped'" @click="changeState('start')">Start run</button>
         <button v-else class="stop" @click="changeState('stop')">Stop run</button>
       </section>
@@ -234,6 +236,7 @@ onMounted(loadDashboard)
       </section>
       <section v-if="dashboard.engine_health === 'degraded'" class="card error" role="alert">
         <strong>Execution paused</strong>
+        <p v-if="isDatabaseContention()">Database access is locked; execution will retry automatically.</p>
         <p>{{ dashboard.market_data_incident?.cause || dashboard.planning_failure?.reason }}</p>
         <p v-if="dashboard.market_data_incident">
           Retry {{ dashboard.market_data_incident.retry_count }} · next attempt
@@ -241,7 +244,7 @@ onMounted(loadDashboard)
         </p>
       </section>
       <section v-else-if="dashboard.market_data_incident?.recovered_at" class="card incident-history">
-        <strong>Latest recovered market-data incident</strong>
+        <strong>Latest recovered {{ isDatabaseContention() ? 'database-contention' : 'market-data' }} incident</strong>
         <p>{{ dashboard.market_data_incident.cause }}</p>
         <p>
           Occurred {{ dashboard.market_data_incident.occurred_at }} ·

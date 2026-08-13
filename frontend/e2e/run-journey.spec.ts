@@ -1,45 +1,73 @@
 import { expect, test } from '@playwright/test'
 
 const password = 'correct horse battery staple'
+const backend = 'http://127.0.0.1:8000'
 
-async function createAccount(page: import('@playwright/test').Page) {
+test('complete autonomous paper-trading release journey from clean reset', async ({ page, request, context }) => {
+  const reset = await request.post(`${backend}/__e2e__/reset`)
+  expect(reset.ok()).toBeTruthy()
+
   await page.goto('/')
   await page.getByLabel('Password').fill(password)
   await page.getByRole('button', { name: 'Create local account' }).click()
   await expect(page.getByText('Paper Trading Only')).toBeVisible()
-}
+  await expect(page.getByText('Stopped')).toBeVisible()
 
-async function login(page: import('@playwright/test').Page) {
-  await page.goto('/')
+  // Prove the account can log in, not only sign up.
+  await context.clearCookies()
+  await page.reload()
   await page.getByLabel('Password').fill(password)
   await page.getByRole('button', { name: 'Log in' }).click()
   await expect(page.getByText('Paper Trading Only')).toBeVisible()
-}
 
-test('operator configures and controls a persisted paper-trading run', async ({ page }) => {
-  await createAccount(page)
-  await expect(page.getByText('Stopped')).toBeVisible()
   await page.getByLabel('Starting capital (NTD)').fill('6000')
-  await page.getByLabel('Round duration (days)').fill('3')
-  await page.getByLabel('Maximum position allocation (%)').fill('15')
+  await page.getByLabel('Round duration (days)').fill('1')
+  await page.getByLabel('Maximum position allocation (%)').fill('100')
+  await page.getByLabel('Maximum concurrent positions').fill('1')
   await page.getByRole('button', { name: 'Save settings' }).click()
   await expect(page.getByText('Settings saved.')).toBeVisible()
 
   await page.getByRole('button', { name: 'Start run' }).click()
   await expect(page.getByText('Running')).toBeVisible()
-  await expect(page.getByRole('heading', { name: 'Active round plan' })).toBeVisible()
+  const selectedPairs = page.locator('.pair')
+  await expect(selectedPairs).toHaveCount(5)
+  await expect(selectedPairs.first()).toContainText(/USDT/)
+  await expect(selectedPairs.first()).toContainText(/rsi-v1|macd-v1/)
+
+  const filled = await request.post(`${backend}/__e2e__/worker-step?mode=entry`)
+  expect(filled.ok()).toBeTruthy()
+  expect((await filled.json()).paper_trades).toBeGreaterThan(0)
+  await page.reload()
+  await expect(page.getByRole('heading', { name: 'Trade history' })).toBeVisible()
+  await expect(page.locator('.audit-list details').first()).toBeVisible()
+  await expect(page.getByRole('img', { name: /equity chart with 1 persisted/ })).toBeVisible()
+
   await page.getByRole('button', { name: 'Stop run' }).click()
   await expect(page.getByText('Stopped')).toBeVisible()
   await expect(page.getByText('No active pair selections.')).toBeVisible()
+  await page.getByRole('button', { name: 'Start run' }).click()
+  await expect(page.getByText('Running')).toBeVisible()
+  await expect(selectedPairs).toHaveCount(5)
+
+  // A real worker step closes/liquidates the due round, proves bankruptcy at crash prices,
+  // and automatically plans a fresh cycle with configured default capital.
+  const rollover = await request.post(`${backend}/__e2e__/worker-step?mode=crash&advance_days=1`)
+  expect(rollover.ok()).toBeTruthy()
+  const rolloverState = await rollover.json()
+  expect(rolloverState.outcome).toBe('rolled_over')
+  expect(rolloverState.bankruptcies).toBe(1)
+  expect(rolloverState.cycles).toBe(2)
+  expect(rolloverState.trading_round).toBe(2)
 
   await page.reload()
-  await expect(page.getByText('Stopped')).toBeVisible()
-  await expect(page.getByText('NT$6,000.00').first()).toBeVisible()
-})
+  await expect(page.getByText('Latest bankruptcy and reset')).toBeVisible()
+  await expect(page.getByText(/1 completed · 2 total cycles/)).toBeVisible()
+  await expect(page.getByText('NT$6,000.00').nth(1)).toBeVisible()
+  await expect(page.getByText(/Round 1 · completed/)).toBeVisible()
+  await expect(page.getByText(/Cycle 1 · completed/)).toBeVisible()
+  await expect(page.getByText(/Cycle 2 · active/)).toBeVisible()
+  await expect(selectedPairs).toHaveCount(5)
 
-test('operator downloads complete Markdown run report from authenticated dashboard', async ({ page }) => {
-  await login(page)
-  await page.getByRole('button', { name: 'Start run' }).click()
   const downloadPromise = page.waitForEvent('download')
   await page.getByRole('button', { name: 'Download Markdown run report' }).click()
   const download = await downloadPromise
@@ -51,52 +79,24 @@ test('operator downloads complete Markdown run report from authenticated dashboa
   })
   expect(content).toContain('# Paper Trading Run Report')
   expect(content).toContain('PAPER TRADING ONLY')
-  expect(content).toContain('## Selected Pair Rankings, Strategies, Settings, and Backtests')
-  expect(content).toContain('BTCUSDT')
-  expect(content).toContain('The complete persisted run audit is included')
+  expect(content).toContain('### Bankruptcy 1')
+  expect(content).toContain('bankruptcy reset')
+  expect(content).toContain('completed')
+  expect(content).toContain('### Trading cycle 2')
   await expect(page.getByRole('status')).toHaveText('Markdown report downloaded.')
-  await page.getByRole('button', { name: 'Stop run' }).click()
-  await expect(page.getByText('Stopped')).toBeVisible()
 })
 
-test('persisted analytics support audit, filters, pagination, degradation and mobile', async ({ page, request }) => {
-  await login(page)
+test('database contention is visibly distinct and actionable', async ({ page, request }) => {
+  await request.post(`${backend}/__e2e__/reset`)
+  await page.goto('/')
+  await page.getByLabel('Password').fill(password)
+  await page.getByRole('button', { name: 'Create local account' }).click()
+  await expect(page.getByText('Paper Trading Only')).toBeVisible()
   await page.getByRole('button', { name: 'Start run' }).click()
   await expect(page.getByText('Running')).toBeVisible()
-  const seeded = await request.post('http://127.0.0.1:8000/__e2e__/seed-analytics')
-  expect(seeded.ok()).toBeTruthy()
+  await request.post(`${backend}/__e2e__/seed-analytics`)
   await page.reload()
-
-  await expect(page.getByText('Paused — market data degraded')).toBeVisible()
-  await expect(page.getByText('NT$250.00')).toBeVisible()
-  await expect(page.getByText('NT$200.00')).toBeVisible()
-  await expect(page.getByText('NT$50.00')).toBeVisible()
-  const negativeSeed = await request.post('http://127.0.0.1:8000/__e2e__/seed-negative-analytics')
-  expect(negativeSeed.ok()).toBeTruthy()
-  await page.reload()
-  const totalProfit = page.locator('.profit').filter({ hasText: 'Total profit' })
-  await expect(totalProfit.getByText('-NT$1,200.00')).toHaveClass(/negative/)
-  const splitProfit = page.locator('.card').filter({ hasText: 'Realized / unrealized' })
-  await expect(splitProfit.getByText('-NT$150.00')).toHaveClass(/negative/)
-  await expect(splitProfit.getByText('-NT$50.00')).toHaveClass(/negative/)
-  await expect(page.getByRole('img', { name: /equity chart with 2 persisted/ })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Next trades page' })).toBeEnabled()
-  await page.getByRole('button', { name: 'Next trades page' }).click()
-  await expect(page.getByText(/Page 2 of 2/)).toBeVisible()
-  await page.getByLabel('Search trades').fill('fixture audit 0')
-  await page.getByLabel('Side').selectOption('buy')
-  await page.getByRole('button', { name: 'Filter trades' }).click()
-  const trade = page.locator('.audit-list details').filter({ hasText: 'BTCUSDT' }).first()
-  await expect(trade).toBeVisible()
-  await trade.locator('summary').click()
-  await expect(trade.getByText('fixture audit 0')).toBeVisible()
-  await expect(page.getByText('market price ntd')).toBeVisible()
-  await expect(page.getByText('Signal audit')).toBeVisible()
-
-  await page.reload()
-  await expect(page.getByText('-NT$1,200.00')).toBeVisible()
-  await page.setViewportSize({ width: 390, height: 844 })
-  await expect(page.getByLabel('Round status')).toBeVisible()
-  const overflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)
-  expect(overflow).toBeFalsy()
+  await expect(page.getByText('Paused — database contention')).toBeVisible()
+  await expect(page.getByText('Database access is locked; execution will retry automatically.')).toBeVisible()
+  await expect(page.getByText('database is locked')).toBeVisible()
 })

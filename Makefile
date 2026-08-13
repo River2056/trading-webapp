@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: install dev backend frontend test lint typecheck build verify
+.PHONY: install dev backend frontend test lint typecheck build package-smoke verify
 
 install:
 	uv sync --extra dev
@@ -34,4 +34,7 @@ build:
 	uv build
 	cd frontend && npm run build
 
-verify: test lint typecheck build
+package-smoke: build
+	uv run python scripts/clean-wheel-smoke.py dist/paper_trading_monolith-0.1.0-py3-none-any.whl
+
+verify: test lint typecheck package-smoke
