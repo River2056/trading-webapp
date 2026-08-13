@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import os
 import secrets
 import sqlite3
@@ -8,11 +10,12 @@ import threading
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal, cast
 
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Response, status
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Response, status
 from pwdlib import PasswordHash
 
 from .database import Database, utc_now
@@ -277,6 +280,209 @@ def create_app(
     def stop() -> dict[str, str]:
         return change_state(RunState.STOPPED)
 
+    @app.get("/api/analytics/charts", dependencies=[Depends(authenticated)])
+    def analytics_charts() -> dict[str, list[dict[str, object]]]:
+        with database.connect() as connection:
+            snapshots = connection.execute(
+                "SELECT ps.valued_at, ps.cash_ntd, ps.position_value_ntd, "
+                "ps.realized_pnl_ntd, ps.unrealized_pnl_ntd, ps.available_capital_ntd, "
+                "ps.total_equity_ntd, ps.round_id, tr.cycle_id, tr.frozen_settings_json, "
+                "c.starting_capital_ntd cycle_starting_capital_ntd "
+                "FROM portfolio_snapshots ps JOIN trading_round tr ON tr.id=ps.round_id "
+                "LEFT JOIN cycles c ON c.id=tr.cycle_id ORDER BY ps.valued_at ASC, ps.id ASC"
+            ).fetchall()
+            rounds = connection.execute(
+                "SELECT r.round_id, tr.cycle_id, r.created_at, r.starting_equity_ntd, "
+                "r.ending_equity_ntd, r.starting_equity_ntd baseline_ntd, r.return_pct "
+                "FROM round_retrospectives r JOIN trading_round tr ON tr.id=r.round_id "
+                "ORDER BY r.created_at ASC, r.round_id ASC"
+            ).fetchall()
+        def snapshot_baseline(snapshot: sqlite3.Row) -> Decimal:
+            frozen = json.loads(str(snapshot["frozen_settings_json"]))
+            value = frozen.get("starting_capital_ntd") or snapshot["cycle_starting_capital_ntd"]
+            return Decimal(str(value))
+
+        equity = [
+            {
+                "at": row["valued_at"], "value_ntd": row["total_equity_ntd"],
+                "cash_ntd": row["cash_ntd"], "position_value_ntd": row["position_value_ntd"],
+                "round_id": row["round_id"], "cycle_id": row["cycle_id"],
+            }
+            for row in snapshots
+        ]
+        return {
+            "equity": equity,
+            "profit": [
+                {
+                    "at": row["valued_at"],
+                    "value_ntd": format(
+                        Decimal(str(row["total_equity_ntd"])) - snapshot_baseline(row), "f"
+                    ),
+                    "baseline_ntd": format(snapshot_baseline(row), "f"),
+                    "round_id": row["round_id"], "cycle_id": row["cycle_id"],
+                    "realized_ntd": row["realized_pnl_ntd"],
+                    "unrealized_ntd": row["unrealized_pnl_ntd"],
+                }
+                for row in snapshots
+            ],
+            "exposure": [
+                {
+                    "at": row["valued_at"], "value_ntd": row["position_value_ntd"],
+                    "available_ntd": row["available_capital_ntd"],
+                    "round_id": row["round_id"], "cycle_id": row["cycle_id"],
+                }
+                for row in snapshots
+            ],
+            "round_performance": [dict(row) for row in rounds],
+        }
+
+    def page_result(
+        connection: sqlite3.Connection,
+        select_sql: str,
+        count_sql: str,
+        parameters: tuple[object, ...],
+        page: int,
+        page_size: int,
+    ) -> dict[str, object]:
+        total = int(connection.execute(count_sql, parameters).fetchone()[0])
+        rows = connection.execute(
+            f"{select_sql} LIMIT ? OFFSET ?", (*parameters, page_size, (page - 1) * page_size)
+        ).fetchall()
+        return {
+            "items": [dict(row) for row in rows], "page": page, "page_size": page_size,
+            "total": total, "pages": math.ceil(total / page_size),
+        }
+
+    @app.get("/api/history/trades", dependencies=[Depends(authenticated)])
+    def trade_history(
+        q: Annotated[str | None, Query(max_length=100)] = None,
+        symbol: Annotated[str | None, Query(pattern=r"^[A-Z0-9]{3,20}$")] = None,
+        side: Literal["buy", "sell"] | None = None,
+        round_id: Annotated[int | None, Query(ge=1)] = None,
+        page: Annotated[int, Query(ge=1)] = 1,
+        page_size: Annotated[int, Query(ge=1, le=100)] = 25,
+    ) -> dict[str, object]:
+        clauses: list[str] = []
+        values: list[object] = []
+        if q:
+            clauses.append(
+                "(t.symbol LIKE ? ESCAPE '\\' OR t.reason LIKE ? ESCAPE '\\' "
+                "OR t.strategy_version LIKE ? ESCAPE '\\')"
+            )
+            escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            values.extend([f"%{escaped}%"] * 3)
+        if symbol:
+            clauses.append("t.symbol=?")
+            values.append(symbol)
+        if side:
+            clauses.append("t.side=?")
+            values.append(side)
+        if round_id:
+            clauses.append("t.round_id=?")
+            values.append(round_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        columns = (
+            "t.id, t.round_id, t.signal_id, t.symbol, t.side, t.quantity, "
+            "t.market_price_ntd, t.fill_price_ntd, t.notional_ntd, t.fee_ntd, "
+            "t.slippage_ntd, t.executed_at, t.source_timestamp, t.strategy_version, "
+            "t.reason, t.realized_pnl_ntd, s.action signal_action, s.outcome signal_outcome, "
+            "s.market_evidence_json"
+        )
+        with database.connect() as connection:
+            result = page_result(
+                connection, f"SELECT {columns} FROM paper_trades t JOIN trading_signals s "  # noqa: S608
+                f"ON s.signal_id=t.signal_id{where} ORDER BY t.executed_at DESC, t.id DESC",
+                f"SELECT COUNT(*) FROM paper_trades t{where}",  # noqa: S608
+                tuple(values), page, page_size,
+            )
+        items = cast(list[dict[str, object]], result["items"])
+        for item in items:
+            item["signal"] = {
+                "action": item.pop("signal_action"), "outcome": item.pop("signal_outcome"),
+                "market_evidence_json": item.pop("market_evidence_json"),
+            }
+        return result
+
+    @app.get("/api/history/rounds", dependencies=[Depends(authenticated)])
+    def round_history(
+        status_filter: Annotated[
+            Literal["planning", "active", "completed", "failed"] | None,
+            Query(alias="status"),
+        ] = None,
+        cycle_id: Annotated[int | None, Query(ge=1)] = None,
+        page: Annotated[int, Query(ge=1)] = 1,
+        page_size: Annotated[int, Query(ge=1, le=100)] = 25,
+    ) -> dict[str, object]:
+        clauses: list[str] = []
+        values: list[object] = []
+        if status_filter:
+            clauses.append("tr.status=?")
+            values.append(status_filter)
+        if cycle_id:
+            clauses.append("tr.cycle_id=?")
+            values.append(cycle_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        columns = (
+            "tr.*, rr.created_at retrospective_created_at, rr.return_pct, "
+            "rr.max_drawdown_pct, rr.total_costs_ntd, rr.trade_count, rr.win_count, "
+            "rr.loss_count, rr.rejected_action_count, rr.pairs_json, rr.strategies_json, "
+            "rr.evidence_json, rr.summary"
+        )
+        with database.connect() as connection:
+            result = page_result(
+                connection, f"SELECT {columns} FROM trading_round tr LEFT JOIN "  # noqa: S608
+                f"round_retrospectives rr ON rr.round_id=tr.id{where} "
+                "ORDER BY tr.started_at DESC, tr.id DESC",
+                f"SELECT COUNT(*) FROM trading_round tr{where}",  # noqa: S608
+                tuple(values), page, page_size,
+            )
+        retrospective_keys = ("retrospective_created_at", "return_pct", "max_drawdown_pct",
+            "total_costs_ntd", "trade_count", "win_count", "loss_count",
+            "rejected_action_count", "pairs_json", "strategies_json", "evidence_json", "summary")
+        items = cast(list[dict[str, object]], result["items"])
+        for item in items:
+            values_map = {key: item.pop(key) for key in retrospective_keys}
+            item["frozen_settings"] = json.loads(str(item.pop("frozen_settings_json")))
+            item["retrospective"] = values_map if values_map["retrospective_created_at"] else None
+        return result
+
+    @app.get("/api/history/cycles", dependencies=[Depends(authenticated)])
+    def cycle_history(
+        status_filter: Annotated[
+            Literal["active", "completed"] | None, Query(alias="status")
+        ] = None,
+        page: Annotated[int, Query(ge=1)] = 1,
+        page_size: Annotated[int, Query(ge=1, le=100)] = 25,
+    ) -> dict[str, object]:
+        where = " WHERE c.status=?" if status_filter else ""
+        values: tuple[object, ...] = (status_filter,) if status_filter else ()
+        columns = (
+            "c.*, COUNT(tr.id) round_count, cr.created_at retrospective_created_at, "
+            "cr.reason retrospective_reason, cr.evidence_json retrospective_evidence_json, "
+            "cr.summary retrospective_summary"
+        )
+        with database.connect() as connection:
+            result = page_result(
+                connection, f"SELECT {columns} FROM cycles c LEFT JOIN trading_round tr "  # noqa: S608
+                "ON tr.cycle_id=c.id LEFT JOIN cycle_retrospectives cr ON cr.cycle_id=c.id"
+                f"{where} GROUP BY c.id ORDER BY c.started_at DESC, c.id DESC",
+                f"SELECT COUNT(*) FROM cycles c{where}",  # noqa: S608
+                values, page, page_size,
+            )
+        items = cast(list[dict[str, object]], result["items"])
+        for item in items:
+            created = item.pop("retrospective_created_at")
+            item["retrospective"] = ({
+                "created_at": created, "reason": item.pop("retrospective_reason"),
+                "evidence_json": item.pop("retrospective_evidence_json"),
+                "summary": item.pop("retrospective_summary"),
+            } if created else None)
+            if not created:
+                item.pop("retrospective_reason")
+                item.pop("retrospective_evidence_json")
+                item.pop("retrospective_summary")
+        return result
+
     @app.get("/api/dashboard", dependencies=[Depends(authenticated)])
     def dashboard() -> dict[str, object]:
         with database.connect() as connection:
@@ -313,14 +519,73 @@ def create_app(
                 "FROM cycles WHERE status='active' ORDER BY id DESC LIMIT 1"
             ).fetchone()
             cycle_count = int(connection.execute("SELECT COUNT(*) FROM cycles").fetchone()[0])
+            experiment_cycle = connection.execute(
+                "SELECT starting_capital_ntd FROM cycles ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+            latest_snapshot = connection.execute(
+                "SELECT ps.* FROM portfolio_snapshots ps JOIN trading_round tr "
+                "ON tr.id=ps.round_id WHERE tr.cycle_id=? "
+                "ORDER BY ps.valued_at DESC, ps.id DESC LIMIT 1",
+                (current_cycle["id"],),
+            ).fetchone() if current_cycle else None
+            active_round = connection.execute(
+                "SELECT id, frozen_settings_json FROM trading_round WHERE status='active' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            selections = connection.execute(
+                "SELECT symbol, selection_rank, strategy_version, strategy_config_json, "
+                "backtest_provenance_json FROM round_selections WHERE round_id=? "
+                "ORDER BY selection_rank",
+                (active_round["id"],),
+            ).fetchall() if active_round else []
         active_incident = incident is not None and bool(incident["active"])
         health = "degraded" if failure or active_incident else "healthy"
         detail = incident["cause"] if active_incident else failure["reason"] if failure else None
+        configured = Decimal(str(row["starting_capital_ntd"]))
+        experiment_initial = Decimal(str(
+            experiment_cycle["starting_capital_ntd"] if experiment_cycle else configured
+        ))
+        cycle_initial = Decimal(str(
+            current_cycle["starting_capital_ntd"] if current_cycle else row["current_capital_ntd"]
+        ))
+        current_value = (
+            latest_snapshot["total_equity_ntd"]
+            if latest_snapshot
+            else row["current_capital_ntd"]
+        )
+        current = Decimal(str(current_value))
+        available_value = latest_snapshot["available_capital_ntd"] if latest_snapshot else current
+        available = Decimal(str(available_value))
+        realized = Decimal(str(latest_snapshot["realized_pnl_ntd"] if latest_snapshot else "0"))
+        unrealized = Decimal(str(latest_snapshot["unrealized_pnl_ntd"] if latest_snapshot else "0"))
+        profit = current - cycle_initial
+        profit_pct = profit / cycle_initial * 100 if cycle_initial else Decimal()
+        direction = "positive" if profit > 0 else "negative" if profit < 0 else "neutral"
         return {
             "product": "Paper Trading Only",
             "desired_state": row["desired_state"],
-            "configured_capital_ntd": f"{float(row['starting_capital_ntd']):.2f}",
-            "current_capital_ntd": f"{float(row['current_capital_ntd']):.2f}",
+            "configured_capital_ntd": f"{configured:.2f}",
+            "initial_capital_ntd": f"{experiment_initial:.2f}",
+            "experiment_initial_capital_ntd": f"{experiment_initial:.2f}",
+            "current_cycle_starting_capital_ntd": f"{cycle_initial:.2f}",
+            "current_capital_ntd": f"{current:.2f}",
+            "available_capital_ntd": f"{available:.2f}",
+            "realized_profit_ntd": f"{realized:.2f}",
+            "unrealized_profit_ntd": f"{unrealized:.2f}",
+            "total_profit_ntd": f"{profit:.2f}",
+            "total_profit_pct": f"{profit_pct:.2f}",
+            "profit_direction": direction,
+            "selected_pairs": [
+                {
+                    **dict(selection),
+                    "strategy_config": json.loads(str(selection["strategy_config_json"])),
+                    "backtest_provenance": json.loads(str(selection["backtest_provenance_json"])),
+                }
+                for selection in selections
+            ],
+            "risk_settings": (
+                json.loads(str(active_round["frozen_settings_json"])) if active_round else None
+            ),
             "engine_health": health,
             "health": health,
             "health_detail": detail,

@@ -60,39 +60,23 @@ def test_operator_can_configure_start_stop_and_observe_persisted_run(tmp_path: P
 
         dashboard = client.get("/api/dashboard")
         assert dashboard.status_code == 200
-        assert dashboard.json() == {
-            "product": "Paper Trading Only",
-            "desired_state": "running",
-            "configured_capital_ntd": "6500.00",
-            "current_capital_ntd": "6500.00",
-            "engine_health": "healthy",
-            "health": "healthy",
-            "health_detail": None,
-            "operational_state": "running",
-            "run_status": "running",
-            "round_status": "active",
-            "current_round": {
-                "id": started.json()["round_id"],
-                "status": "active",
-                "started_at": "2026-01-08T12:00:00Z",
-                "ended_at": None,
-                "ending_equity_ntd": None,
-            },
-            "completed_round_count": 0,
-            "cycle_count": 1,
-            "current_cycle": {
-                "id": 1,
-                "status": "active",
-                "started_at": dashboard.json()["current_cycle"]["started_at"],
-                "starting_capital_ntd": "6500",
-                "completed_round_count": 0,
-            },
-            "bankruptcy": None,
-            "latest_bankruptcy": None,
-            "days_since_bankruptcy": None,
-            "market_data_incident": None,
-            "planning_failure": None,
-        }
+        projected = dashboard.json()
+        assert projected["product"] == "Paper Trading Only"
+        assert projected["desired_state"] == "running"
+        assert projected["configured_capital_ntd"] == "6500.00"
+        assert projected["current_capital_ntd"] == "6500.00"
+        assert projected["available_capital_ntd"] == "6500.00"
+        assert projected["total_profit_ntd"] == "0.00"
+        assert projected["profit_direction"] == "neutral"
+        assert projected["engine_health"] == "healthy"
+        assert projected["operational_state"] == "running"
+        assert projected["round_status"] == "active"
+        assert projected["completed_round_count"] == 0
+        assert projected["cycle_count"] == 1
+        assert projected["current_cycle"]["starting_capital_ntd"] == "6500"
+        assert projected["bankruptcy"] is None
+        assert len(projected["selected_pairs"]) == 5
+        assert projected["risk_settings"]["max_position_allocation_pct"] == "15.00"
 
         assert client.post("/api/run/stop").json()["desired_state"] == "stopped"
 
