@@ -74,6 +74,7 @@ def create_app(
         database, market_data or BinanceMarketData(clock=planning_clock), planning_clock
     )
     worker = TradingWorker(database, engine, planning_clock)
+    control_lock = threading.Lock()
     should_start_worker = market_data is None if start_worker is None else start_worker
 
     @asynccontextmanager
@@ -205,6 +206,10 @@ def create_app(
 
     @app.post("/api/run/start", dependencies=[Depends(authenticated)])
     def start() -> dict[str, object]:
+        with control_lock:
+            return start_serialized()
+
+    def start_serialized() -> dict[str, object]:
         with database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             active = connection.execute(
@@ -279,7 +284,8 @@ def create_app(
 
     @app.post("/api/run/stop", dependencies=[Depends(authenticated)])
     def stop() -> dict[str, str]:
-        return change_state(RunState.STOPPED)
+        with control_lock:
+            return change_state(RunState.STOPPED)
 
     @app.get("/api/analytics/charts", dependencies=[Depends(authenticated)])
     def analytics_charts() -> dict[str, list[dict[str, object]]]:

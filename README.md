@@ -24,7 +24,9 @@ SQLite data is stored at `data/paper-trading.sqlite3`. Explicit SQL migrations r
 
 ## Defaults and controls
 
-New installations begin stopped with 5,000 NTD virtual capital, seven-day rounds, a five-minute strategy cadence, and conservative position, concurrent-position, stop-loss, take-profit, daily-loss, fee, and slippage limits. Settings are validated and can only change while the run is stopped. Start/stop changes the persisted desired state; no market worker or real execution is included in this bootstrap ticket.
+New installations begin stopped with 5,000 NTD virtual capital, seven-day rounds, a five-minute strategy cadence, and conservative position, concurrent-position, stop-loss, take-profit, daily-loss, fee, and slippage limits. Settings are validated and can only change while the run is stopped. Start/stop changes the persisted desired state. The in-process worker resumes only persisted running runs, serializes SQLite state transitions, retries transient market-data and database-lock failures with bounded backoff, and shuts down only after an in-flight transaction completes.
+
+All amounts and fills are conservative simulation assumptions, not executable quotes or financial advice. Default maximum allocation is 10% per position, at most three positions, 5% stop loss, 10% take profit, 3% daily realized-loss pause, 0.10% fee, and 0.10% slippage. Public market data can be delayed or unavailable; unsafe inputs pause simulated trading and are shown as degraded health. Bankruptcy is declared only when every otherwise-qualified candidate has valid exchange rules and is proven unfundable; unknown data remains a recoverable degradation.
 
 ## Quality checks
 

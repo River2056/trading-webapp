@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 from datetime import timedelta
 from decimal import Decimal
@@ -10,8 +11,9 @@ from fastapi.testclient import TestClient
 
 from backend.app.main import create_app
 from backend.app.market_data import Candle, MarketDataError, MarketSummary, NtdConversion
-from backend.app.worker import TradingWorker
+from backend.app.worker import TradingWorker, WorkerResult
 from backend.tests.test_paper_trading import active_engine, rows
+from backend.tests.test_round_planning import FixtureMarketData
 
 
 def test_worker_advances_persisted_running_run_after_restart_but_not_stopped_run(
@@ -441,3 +443,69 @@ def test_lifespan_waits_for_inflight_worker_and_exits_with_thread_dead(tmp_path:
         thread.name == "paper-trading-worker" and thread.is_alive()
         for thread in threading.enumerate()
     )
+
+
+def test_stop_wins_when_it_races_initial_round_activation(tmp_path: Path) -> None:
+    data = FixtureMarketData()
+    app = create_app(
+        tmp_path / "stop-wins.sqlite3",
+        market_data=data,
+        clock=lambda: data.observed_at,
+        start_worker=False,
+    )
+    planned = threading.Event()
+    release_start = threading.Event()
+    original_plan = app.state.engine._plan_round
+
+    def pause_after_plan(*args: object, **kwargs: object):
+        plan = original_plan(*args, **kwargs)
+        planned.set()
+        assert release_start.wait(2)
+        return plan
+
+    app.state.engine._plan_round = pause_after_plan
+    with TestClient(app) as client:
+        client.post("/api/auth/signup", json={"password": "correct horse battery staple"})
+        start_response: list[object] = []
+        starter = threading.Thread(
+            target=lambda: start_response.append(client.post("/api/run/start"))
+        )
+        starter.start()
+        assert planned.wait(2)
+        stop_response: list[object] = []
+        stopper = threading.Thread(
+            target=lambda: stop_response.append(client.post("/api/run/stop"))
+        )
+        stopper.start()
+        release_start.set()
+        starter.join(3)
+        stopper.join(3)
+        assert len(start_response) == 1
+        assert len(stop_response) == 1
+        dashboard = client.get("/api/dashboard").json()
+
+    assert dashboard["desired_state"] == "stopped"
+    assert dashboard["operational_state"] == "stopped"
+
+
+def test_worker_retries_sqlite_busy_without_dying(caplog: pytest.LogCaptureFixture) -> None:
+    worker = object.__new__(TradingWorker)
+    worker._stop = threading.Event()
+    attempts = 0
+    waits: list[float] = []
+
+    def step():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("database is locked")
+        worker.stop()
+        return WorkerResult("advanced")
+
+    worker.step = step
+    worker.sleeper = waits.append
+    worker.run_forever(poll_seconds=0.25)
+
+    assert attempts == 2
+    assert waits == [0.25, 0.25]
+    assert "SQLite is busy" in caplog.text

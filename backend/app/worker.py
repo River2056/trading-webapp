@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from collections.abc import Callable
@@ -18,6 +19,8 @@ from .engine import (
 )
 from .lifecycle import RoundLifecycle
 from .market_data import MarketDataError
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -219,7 +222,17 @@ class TradingWorker:
         self._stop.clear()
         steps = 0
         while not self._stop.is_set() and (max_steps is None or steps < max_steps):
-            result = self.step()
+            try:
+                result = self.step()
+            except sqlite3.OperationalError as error:
+                if "locked" not in str(error).lower() and "busy" not in str(error).lower():
+                    raise
+                logger.warning(
+                    "SQLite is busy; worker evaluation will retry in %.3f seconds",
+                    poll_seconds,
+                    exc_info=error,
+                )
+                result = WorkerResult("backoff", poll_seconds)
             steps += 1
             self.sleeper(max(poll_seconds, result.retry_after_seconds))
 
