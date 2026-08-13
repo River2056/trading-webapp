@@ -52,9 +52,12 @@ class Database:
         now = utc_now()
         with self.connect() as connection, connection:
             connection.execute(
-                """INSERT OR IGNORE INTO run_settings VALUES
-                (1, '5000.00', 7, 300, '10.00', 3, '5.00', '10.00', '3.00',
-                 '0.10', '0.10', ?)""",
+                """INSERT OR IGNORE INTO run_settings
+                (id, starting_capital_ntd, round_duration_days, strategy_cadence_seconds,
+                 max_position_allocation_pct, max_concurrent_positions, stop_loss_pct,
+                 take_profit_pct, daily_loss_limit_pct, fee_pct, slippage_pct, updated_at)
+                VALUES (1, '5000.00', 7, 300, '10.00', 3, '5.00', '10.00', '3.00',
+                        '0.10', '0.10', ?)""",
                 (now,),
             )
             connection.execute(

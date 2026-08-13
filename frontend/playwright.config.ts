@@ -5,7 +5,7 @@ export default defineConfig({
   use: { baseURL: 'http://127.0.0.1:4173' },
   webServer: [
     {
-      command: 'rm -f data/playwright.sqlite3 && TRADING_DATABASE_PATH=data/playwright.sqlite3 uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000',
+      command: 'rm -f data/playwright.sqlite3 && TRADING_DATABASE_PATH=data/playwright.sqlite3 uv run uvicorn backend.tests.e2e_app:app --host 127.0.0.1 --port 8000',
       cwd: '..',
       url: 'http://127.0.0.1:8000/docs',
       reuseExistingServer: false,

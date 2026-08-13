@@ -1,10 +1,12 @@
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.main import create_app
+from backend.tests.test_round_planning import FixtureMarketData
 
 
 def test_api_is_protected_and_single_account_password_is_hashed(tmp_path: Path) -> None:
@@ -35,7 +37,11 @@ def test_api_is_protected_and_single_account_password_is_hashed(tmp_path: Path) 
         assert stored != "correct horse battery staple"
         assert stored.startswith("$argon2")
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
-        assert connection.execute("SELECT version FROM schema_migrations").fetchall() == [(1,)]
+        assert connection.execute("SELECT version FROM schema_migrations").fetchall() == [
+            (1,),
+            (2,),
+            (3,),
+        ]
 
 
 def test_logout_revokes_the_server_side_session(tmp_path: Path) -> None:
@@ -77,7 +83,13 @@ def test_database_rejects_invalid_settings_even_outside_the_api(tmp_path: Path) 
 
 
 def test_settings_validation_and_running_settings_lock(tmp_path: Path) -> None:
-    with TestClient(create_app(tmp_path / "validation.sqlite3")) as client:
+    with TestClient(
+        create_app(
+            tmp_path / "validation.sqlite3",
+            market_data=FixtureMarketData(),
+            clock=lambda: datetime(2026, 1, 8, 12, tzinfo=UTC),
+        )
+    ) as client:
         client.post("/api/auth/signup", json={"password": "correct horse battery staple"})
         defaults = client.get("/api/settings")
         assert defaults.status_code == 200

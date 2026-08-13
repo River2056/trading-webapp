@@ -4,6 +4,7 @@ import hashlib
 import os
 import secrets
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -13,6 +14,8 @@ from fastapi import Cookie, Depends, FastAPI, HTTPException, Response, status
 from pwdlib import PasswordHash
 
 from .database import Database, utc_now
+from .engine import RoundPlanningError, RoundPlanningSettings, TradingEngine
+from .market_data import BinanceMarketData, MarketData
 from .schemas import PasswordInput, RunSettings
 
 SESSION_COOKIE = "paper_session"
@@ -50,12 +53,21 @@ def _set_session(response: Response, database: Database) -> None:
     )
 
 
-def create_app(database_path: Path | str = "data/paper-trading.sqlite3") -> FastAPI:
+def create_app(
+    database_path: Path | str = "data/paper-trading.sqlite3",
+    market_data: MarketData | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> FastAPI:
     database = Database(Path(database_path))
     database.migrate()
     database.ensure_defaults()
     app = FastAPI(title="Paper Trading Only", version="0.1.0")
     app.state.database = database
+    planning_clock = clock or (lambda: datetime.now(UTC))
+    engine = TradingEngine(
+        database, market_data or BinanceMarketData(clock=planning_clock), planning_clock
+    )
+    app.state.engine = engine
 
     def authenticated(
         paper_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
@@ -133,7 +145,10 @@ def create_app(database_path: Path | str = "data/paper-trading.sqlite3") -> Fast
                 """UPDATE run_settings SET starting_capital_ntd=?, round_duration_days=?,
                 strategy_cadence_seconds=?, max_position_allocation_pct=?,
                 max_concurrent_positions=?, stop_loss_pct=?, take_profit_pct=?,
-                daily_loss_limit_pct=?, fee_pct=?, slippage_pct=?, updated_at=? WHERE id=1""",
+                daily_loss_limit_pct=?, fee_pct=?, slippage_pct=?, candle_interval=?,
+                backtest_lookback_candles=?, minimum_liquidity_ntd=?, minimum_net_return_pct=?,
+                minimum_entry_count=?, minimum_trade_count=?, max_conversion_age_seconds=?,
+                max_candle_age_seconds=?, updated_at=? WHERE id=1""",
                 (*values.values(), utc_now()),
             )
             connection.execute(
@@ -151,26 +166,72 @@ def create_app(database_path: Path | str = "data/paper-trading.sqlite3") -> Fast
         return {"desired_state": desired_state.value}
 
     @app.post("/api/run/start", dependencies=[Depends(authenticated)])
-    def start() -> dict[str, str]:
-        return change_state(RunState.RUNNING)
+    def start() -> dict[str, object]:
+        with database.connect() as connection:
+            active = connection.execute(
+                "SELECT id FROM trading_round WHERE status='active' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if active is not None:
+                selections = connection.execute(
+                    "SELECT symbol FROM round_selections WHERE round_id=? ORDER BY selection_rank",
+                    (active["id"],),
+                ).fetchall()
+                change_state(RunState.RUNNING)
+                return {
+                    "desired_state": RunState.RUNNING.value,
+                    "round_id": active["id"],
+                    "selections": [selection["symbol"] for selection in selections],
+                }
+            row = connection.execute("SELECT * FROM run_settings WHERE id=1").fetchone()
+        planning_settings = RoundPlanningSettings.from_mapping(dict(row))
+        try:
+            plan = engine.activate_round(planning_settings)
+        except RoundPlanningError as error:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, f"round planning failed: {error}"
+            ) from error
+        change_state(RunState.RUNNING)
+        return {
+            "desired_state": RunState.RUNNING.value,
+            "round_id": plan.round_id,
+            "selections": [selection.symbol for selection in plan.selections],
+        }
 
     @app.post("/api/run/stop", dependencies=[Depends(authenticated)])
     def stop() -> dict[str, str]:
         return change_state(RunState.STOPPED)
 
     @app.get("/api/dashboard", dependencies=[Depends(authenticated)])
-    def dashboard() -> dict[str, str]:
+    def dashboard() -> dict[str, object]:
         with database.connect() as connection:
             row = connection.execute(
                 """SELECT desired_state, current_capital_ntd, starting_capital_ntd
                 FROM trading_run JOIN run_settings ON run_settings.id = trading_run.id
                 WHERE trading_run.id = 1"""
             ).fetchone()
+            failure = connection.execute(
+                "SELECT round_id, occurred_at, reason, active FROM planning_failures "
+                "WHERE active=1 ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        health = "degraded" if failure else "healthy"
         return {
             "product": "Paper Trading Only",
             "desired_state": row["desired_state"],
             "configured_capital_ntd": f"{float(row['starting_capital_ntd']):.2f}",
             "current_capital_ntd": f"{float(row['current_capital_ntd']):.2f}",
+            "engine_health": health,
+            "health": health,
+            "health_detail": failure["reason"] if failure else None,
+            "planning_failure": (
+                {
+                    "active": True,
+                    "round_id": failure["round_id"],
+                    "occurred_at": failure["occurred_at"],
+                    "reason": failure["reason"],
+                }
+                if failure
+                else None
+            ),
         }
 
     return app

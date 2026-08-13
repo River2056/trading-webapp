@@ -6,6 +6,8 @@ type Dashboard = {
   desired_state: 'running' | 'stopped'
   configured_capital_ntd: string
   current_capital_ntd: string
+  engine_health: 'healthy' | 'degraded'
+  planning_failure: { reason: string; occurred_at: string } | null
 }
 
 type RunSettings = {
@@ -19,6 +21,14 @@ type RunSettings = {
   daily_loss_limit_pct: string
   fee_pct: string
   slippage_pct: string
+  candle_interval: string
+  backtest_lookback_candles: number
+  minimum_liquidity_ntd: string
+  minimum_net_return_pct: string
+  minimum_entry_count: number
+  minimum_trade_count: number
+  max_conversion_age_seconds: number
+  max_candle_age_seconds: number
 }
 
 const dashboard = ref<Dashboard | null>(null)
@@ -102,6 +112,10 @@ onMounted(loadDashboard)
         <button v-if="dashboard.desired_state === 'stopped'" @click="changeState('start')">Start run</button>
         <button v-else class="stop" @click="changeState('stop')">Stop run</button>
       </section>
+      <section v-if="dashboard.engine_health === 'degraded'" class="card error" role="alert">
+        <strong>Planning health degraded</strong>
+        <p>{{ dashboard.planning_failure?.reason }}</p>
+      </section>
       <section class="metrics">
         <article class="card"><p>Configured capital</p><strong>{{ Number(dashboard.configured_capital_ntd).toLocaleString('en-US', { style: 'currency', currency: 'TWD' }) }}</strong></article>
         <article class="card"><p>Current capital</p><strong>{{ Number(dashboard.current_capital_ntd).toLocaleString('en-US', { style: 'currency', currency: 'TWD' }) }}</strong></article>
@@ -119,6 +133,14 @@ onMounted(loadDashboard)
           <label>Daily loss limit (%)<input v-model="settings.daily_loss_limit_pct" type="number" min="0.01" max="99.99" step="0.01"></label>
           <label>Fee (%)<input v-model="settings.fee_pct" type="number" min="0" max="9.99" step="0.01"></label>
           <label>Slippage (%)<input v-model="settings.slippage_pct" type="number" min="0" max="9.99" step="0.01"></label>
+          <label>Candle interval<input v-model="settings.candle_interval" type="text"></label>
+          <label>Backtest candles<input v-model.number="settings.backtest_lookback_candles" type="number" min="30" max="1000"></label>
+          <label>Minimum liquidity (NTD)<input v-model="settings.minimum_liquidity_ntd" type="number" min="0"></label>
+          <label>Minimum net return (%)<input v-model="settings.minimum_net_return_pct" type="number" step="0.01"></label>
+          <label>Minimum entries<input v-model.number="settings.minimum_entry_count" type="number" min="1"></label>
+          <label>Minimum fills/trades<input v-model.number="settings.minimum_trade_count" type="number" min="1"></label>
+          <label>Maximum conversion age (seconds)<input v-model.number="settings.max_conversion_age_seconds" type="number" min="1"></label>
+          <label>Maximum candle age (seconds)<input v-model.number="settings.max_candle_age_seconds" type="number" min="1"></label>
         </div>
         <button @click="saveSettings">Save settings</button>
         <span class="success">{{ settingsMessage }}</span>
