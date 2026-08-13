@@ -171,6 +171,40 @@ test('healthy dashboard still renders the latest recovered market-data incident'
   expect(screen.getByText(/recovered 2026-01-01T00:03:00Z/i)).toBeTruthy()
 })
 
+test('authenticated operator can download the complete Markdown run report with status feedback', async () => {
+  const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+    const url = String(input)
+    if (url === '/api/dashboard') return jsonResponse({ product: 'Paper Trading Only', desired_state: 'stopped',
+      operational_state: 'stopped', engine_health: 'healthy', configured_capital_ntd: '5000',
+      initial_capital_ntd: '5000', current_capital_ntd: '5000', planning_failure: null,
+      market_data_incident: null })
+    if (url === '/api/settings') return jsonResponse({})
+    if (url === '/api/reports/run.md') return Promise.resolve(new Response('# Paper Trading Run Report\n', {
+      headers: { 'Content-Type': 'text/markdown; charset=utf-8' },
+    }))
+    if (url === '/api/analytics/charts') return jsonResponse({ equity: [], profit: [], exposure: [], round_performance: [] })
+    return jsonResponse({ items: [], total: 0, page: 1, page_size: 10, pages: 0 })
+  })
+  const click = vi.fn()
+  const createElement = document.createElement.bind(document)
+  vi.spyOn(document, 'createElement').mockImplementation(((tagName: string) => {
+    const element = createElement(tagName)
+    if (tagName.toLowerCase() === 'a') element.click = click
+    return element
+  }) as typeof document.createElement)
+  Object.defineProperty(window.URL, 'createObjectURL', { configurable: true, value: vi.fn(() => 'blob:report') })
+  Object.defineProperty(window.URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+
+  render(App)
+  const button = await screen.findByRole('button', { name: 'Download Markdown run report' })
+  await fireEvent.click(button)
+  expect((await screen.findByRole('status')).textContent).toBe('Markdown report downloaded.')
+
+  expect(fetchMock).toHaveBeenCalledWith('/api/reports/run.md', expect.objectContaining({ credentials: 'same-origin' }))
+  expect(window.URL.createObjectURL).toHaveBeenCalled()
+  expect(click).toHaveBeenCalled()
+})
+
 test('running dashboard always renders latest bankruptcy reset history', async () => {
   vi.spyOn(globalThis, 'fetch').mockImplementationOnce(() => jsonResponse({
     product: 'Paper Trading Only', desired_state: 'running', operational_state: 'running',

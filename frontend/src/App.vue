@@ -64,6 +64,9 @@ const needsAuthentication = ref(false)
 const password = ref('')
 const error = ref('')
 const settingsMessage = ref('')
+const reportStatus = ref('')
+const reportError = ref('')
+const reportDownloading = ref(false)
 type ChartPoint = { at?: string; value_ntd?: string; round_id?: number; cycle_id?: number; baseline_ntd?: string; return_pct?: string }
 type Page<T> = { items: T[]; page: number; page_size: number; total: number; pages: number }
 type Trade = { id: number; round_id: number; symbol: string; side: string; quantity: string; market_price_ntd: string; fill_price_ntd: string; notional_ntd: string; fee_ntd: string; slippage_ntd: string; strategy_version: string; realized_pnl_ntd: string; executed_at: string; source_timestamp: string; reason: string; signal: { action: string; outcome: string; market_evidence_json: string } }
@@ -173,6 +176,23 @@ async function saveSettings() {
   await loadDashboard()
 }
 
+async function downloadReport() {
+  reportDownloading.value = true; reportStatus.value = ''; reportError.value = ''
+  try {
+    const response = await fetch('/api/reports/run.md', { credentials: 'same-origin' })
+    if (!response.ok) throw new Error('request failed')
+    const url = URL.createObjectURL(await response.blob())
+    const link = document.createElement('a')
+    link.href = url; link.download = 'paper-trading-run-report.md'; link.click()
+    URL.revokeObjectURL(url)
+    reportStatus.value = 'Markdown report downloaded.'
+  } catch {
+    reportError.value = 'Markdown report could not be downloaded.'
+  } finally {
+    reportDownloading.value = false
+  }
+}
+
 onMounted(loadDashboard)
 </script>
 
@@ -200,6 +220,17 @@ onMounted(loadDashboard)
         <div><p>Persisted run state</p><h2>{{ dashboard.operational_state === 'degraded' ? 'Paused — market data degraded' : dashboard.operational_state === 'running' ? 'Running' : 'Stopped' }}</h2></div>
         <button v-if="dashboard.desired_state === 'stopped'" @click="changeState('start')">Start run</button>
         <button v-else class="stop" @click="changeState('stop')">Stop run</button>
+      </section>
+      <section class="card report-download" aria-labelledby="run-report-heading">
+        <div>
+          <h2 id="run-report-heading">Run report</h2>
+          <p>Download the complete persisted paper-trading audit as Markdown.</p>
+        </div>
+        <button :disabled="reportDownloading" @click="downloadReport">
+          {{ reportDownloading ? 'Preparing Markdown report…' : 'Download Markdown run report' }}
+        </button>
+        <p v-if="reportStatus" role="status" class="success">{{ reportStatus }}</p>
+        <p v-if="reportError" role="alert" class="error">{{ reportError }}</p>
       </section>
       <section v-if="dashboard.engine_health === 'degraded'" class="card error" role="alert">
         <strong>Execution paused</strong>
@@ -332,6 +363,9 @@ h2 { margin: 4px 0 16px; font-size: 2rem; }
 .eyebrow { color: #70e1bd; text-transform: uppercase; letter-spacing: .16em; font-size: .75rem; font-weight: 700; }
 .card { border: 1px solid #24364f; border-radius: 18px; padding: 28px; background: #0d1b2d; box-shadow: 0 18px 60px #0005; }
 .hero { margin-top: 42px; }
+.report-download { display: flex; align-items: center; gap: 20px; margin-top: 20px; }
+.report-download > div { flex: 1; }.report-download h2, .report-download p { margin: 0; }
+.report-download .success, .report-download .error { flex-basis: 100%; }
 .metrics, .settings, .workspace, .histories { margin-top: 20px; }
 .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
 .metrics article { min-width: 0; }
@@ -358,5 +392,5 @@ button.stop { color: #fff; background: #cf4c62; }
 .access label { margin: 28px 0 8px; }
 .access .actions { justify-content: flex-start; margin-top: 18px; }
 .error { color: #ff8799; }
-@media (max-width: 720px) { header, .hero, .filters, .pagination { align-items: stretch; flex-direction: column; } .metrics, .workspace, .history-grid, .charts, .settings-grid { grid-template-columns: minmax(0, 1fr); } .charts h2 { grid-column: 1; } .card { min-width: 0; padding: 20px; } strong { overflow-wrap: anywhere; } }
+@media (max-width: 720px) { header, .hero, .report-download, .filters, .pagination { align-items: stretch; flex-direction: column; } .metrics, .workspace, .history-grid, .charts, .settings-grid { grid-template-columns: minmax(0, 1fr); } .charts h2 { grid-column: 1; } .card { min-width: 0; padding: 20px; } strong { overflow-wrap: anywhere; } }
 </style>

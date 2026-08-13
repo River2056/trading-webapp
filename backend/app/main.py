@@ -21,6 +21,7 @@ from pwdlib import PasswordHash
 from .database import Database, utc_now
 from .engine import RoundPlanningError, RoundPlanningSettings, TradingEngine
 from .market_data import BinanceMarketData, MarketData
+from .reporting import build_run_report
 from .schemas import PasswordInput, RunSettings
 from .worker import TradingWorker
 
@@ -482,6 +483,19 @@ def create_app(
                 item.pop("retrospective_evidence_json")
                 item.pop("retrospective_summary")
         return result
+
+    @app.get("/api/reports/run.md", dependencies=[Depends(authenticated)])
+    def run_report() -> Response:
+        with database.connect() as connection:
+            report = build_run_report(connection, planning_clock)
+        return Response(
+            content=report,
+            media_type="text/markdown; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="paper-trading-run-report.md"',
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     @app.get("/api/dashboard", dependencies=[Depends(authenticated)])
     def dashboard() -> dict[str, object]:

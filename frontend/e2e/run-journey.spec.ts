@@ -37,6 +37,28 @@ test('operator configures and controls a persisted paper-trading run', async ({ 
   await expect(page.getByText('NT$6,000.00').first()).toBeVisible()
 })
 
+test('operator downloads complete Markdown run report from authenticated dashboard', async ({ page }) => {
+  await login(page)
+  await page.getByRole('button', { name: 'Start run' }).click()
+  const downloadPromise = page.waitForEvent('download')
+  await page.getByRole('button', { name: 'Download Markdown run report' }).click()
+  const download = await downloadPromise
+  expect(download.suggestedFilename()).toBe('paper-trading-run-report.md')
+  const content = await download.createReadStream().then(async (stream) => {
+    const chunks: Buffer[] = []
+    for await (const chunk of stream) chunks.push(Buffer.from(chunk))
+    return Buffer.concat(chunks).toString('utf8')
+  })
+  expect(content).toContain('# Paper Trading Run Report')
+  expect(content).toContain('PAPER TRADING ONLY')
+  expect(content).toContain('## Selected Pair Rankings, Strategies, Settings, and Backtests')
+  expect(content).toContain('BTCUSDT')
+  expect(content).toContain('The complete persisted run audit is included')
+  await expect(page.getByRole('status')).toHaveText('Markdown report downloaded.')
+  await page.getByRole('button', { name: 'Stop run' }).click()
+  await expect(page.getByText('Stopped')).toBeVisible()
+})
+
 test('persisted analytics support audit, filters, pagination, degradation and mobile', async ({ page, request }) => {
   await login(page)
   await page.getByRole('button', { name: 'Start run' }).click()
