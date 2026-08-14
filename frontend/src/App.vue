@@ -263,20 +263,46 @@ onUnmounted(() => { if (dashboardPoll !== undefined) window.clearInterval(dashbo
     </section>
 
     <template v-else-if="dashboard">
-      <header>
-        <div><p class="eyebrow">Autonomous crypto experiment</p><h1>{{ dashboard.product }}</h1></div>
-        <span class="badge">No real orders</span>
-      </header>
+      <div class="app-shell">
+        <aside class="sidebar">
+          <a class="brand" href="#overview" aria-label="Paper Pilot home">
+            <span class="brand-mark" aria-hidden="true">P</span>
+            <span>Paper Pilot</span>
+          </a>
+          <nav aria-label="Primary navigation">
+            <a class="active" href="#overview"><span aria-hidden="true">⌁</span>Overview</a>
+            <a href="#portfolio"><span aria-hidden="true">◫</span>Portfolio</a>
+            <a href="#strategies"><span aria-hidden="true">⌘</span>Strategies</a>
+            <a href="#history"><span aria-hidden="true">↗</span>History</a>
+            <a v-if="dashboard.desired_state === 'stopped' && settings" href="#settings"><span aria-hidden="true">⚙</span>Settings</a>
+            <span v-else class="nav-disabled" aria-disabled="true"><span aria-hidden="true">⚙</span>Settings</span>
+          </nav>
+          <div class="sidebar-note">
+            <span class="safe-icon" aria-hidden="true">✓</span>
+            <div><strong>Simulation mode</strong><small>No exchange orders</small></div>
+          </div>
+        </aside>
+        <div class="app-content">
+          <header class="topbar">
+            <div><p class="eyebrow">Autonomous crypto experiment</p><h1 id="overview">Overview</h1></div>
+            <div class="topbar-actions">
+              <a class="search-pill" href="#history"><span aria-hidden="true">⌕</span> Search activity</a>
+              <span class="badge">No real orders</span>
+              <span class="operator-dot" aria-label="Local operator">LO</span>
+            </div>
+          </header>
       <p v-if="stateChanging" class="sr-only" role="status" aria-label="Run state change in progress">{{ stateChanging === 'start' ? 'Starting agent' : 'Stopping agent' }}</p>
       <fieldset :disabled="stateChanging !== null" class="action-lock" :aria-busy="stateChanging !== null">
         <section class="card hero">
-          <div><p>Persisted run state</p><h2>{{ dashboard.operational_state === 'degraded' ? (isDatabaseContention() ? 'Paused — database contention' : 'Paused — market data degraded') : dashboard.operational_state === 'running' ? 'Running' : 'Stopped' }}</h2></div>
+          <div class="hero-copy"><p class="eyebrow">{{ dashboard.product }}</p><h2>Trade the market.<br><span>Risk nothing real.</span></h2><p>Monitor your autonomous strategy, portfolio, and every persisted decision from one command center.</p></div>
+          <div class="run-control"><p>Persisted run state</p><h3>{{ dashboard.operational_state === 'degraded' ? (isDatabaseContention() ? 'Paused — database contention' : 'Paused — market data degraded') : dashboard.operational_state === 'running' ? 'Running' : 'Stopped' }}</h3>
           <button v-if="dashboard.desired_state === 'stopped'" @click="changeState('start')">
             <span v-if="stateChanging === 'start'" class="spinner" aria-hidden="true" />{{ stateChanging === 'start' ? 'Starting agent…' : 'Start run' }}
           </button>
           <button v-else class="stop" @click="changeState('stop')">
             <span v-if="stateChanging === 'stop'" class="spinner" aria-hidden="true" />{{ stateChanging === 'stop' ? 'Stopping agent…' : 'Stop run' }}
           </button>
+          </div>
         </section>
         <p v-if="stateChangeError" class="card error" role="alert">{{ stateChangeError }}</p>
         <section class="card agent-activity" aria-live="polite" aria-labelledby="agent-activity-heading">
@@ -323,7 +349,7 @@ onUnmounted(() => { if (dashboardPoll !== undefined) window.clearInterval(dashbo
           <p>Ending equity NT${{ dashboard.bankruptcy.ending_equity_ntd }} · declared {{ dashboard.bankruptcy.declared_at }}</p>
           <p>Cycle {{ dashboard.cycle_count }} · {{ dashboard.days_since_bankruptcy }} days since bankruptcy</p>
         </section>
-        <section class="metrics capital-grid">
+        <section id="portfolio" class="metrics capital-grid">
           <article class="card"><p>Initial capital</p><strong>{{ money(dashboard.initial_capital_ntd || dashboard.configured_capital_ntd) }}</strong></article>
           <article class="card"><p>Current capital</p><strong>{{ money(dashboard.current_capital_ntd) }}</strong></article>
           <article class="card"><p>Available capital</p><strong>{{ money(dashboard.available_capital_ntd || dashboard.current_capital_ntd) }}</strong></article>
@@ -334,7 +360,7 @@ onUnmounted(() => { if (dashboardPoll !== undefined) window.clearInterval(dashbo
           <article class="card"><p>Bankruptcy</p><strong>{{ dashboard.days_since_bankruptcy == null ? 'Never' : `${dashboard.days_since_bankruptcy} days ago` }}</strong></article>
         </section>
         <section class="workspace">
-          <article class="card strategies">
+          <article id="strategies" class="card strategies">
             <h2>Active round plan</h2>
             <p v-if="dashboard.desired_state === 'stopped' || !dashboard.selected_pairs?.length" class="empty">No active pair selections.</p>
             <div v-for="pair in dashboard.desired_state === 'running' ? dashboard.selected_pairs : []" :key="pair.symbol" class="pair">
@@ -356,7 +382,7 @@ onUnmounted(() => { if (dashboardPoll !== undefined) window.clearInterval(dashbo
             </template>
           </article>
         </section>
-        <section class="card histories">
+        <section id="history" class="card histories">
           <h2>Trade history</h2>
           <form class="filters" @submit.prevent="filterTrades">
             <label>Search trades<input v-model="historySearch" type="search" placeholder="Pair, strategy, reason"></label>
@@ -392,7 +418,7 @@ onUnmounted(() => { if (dashboardPoll !== undefined) window.clearInterval(dashbo
             </div>
           </div>
         </section>
-        <section v-if="dashboard.desired_state === 'stopped' && settings" class="card settings">
+        <section v-if="dashboard.desired_state === 'stopped' && settings" id="settings" class="card settings">
           <h2>Run settings</h2>
           <div class="settings-grid">
             <label>Starting capital (NTD)<input v-model="settings.starting_capital_ntd" type="number" min="0.01" step="0.01"></label>
@@ -418,60 +444,105 @@ onUnmounted(() => { if (dashboardPoll !== undefined) window.clearInterval(dashbo
           <span class="success">{{ settingsMessage }}</span>
         </section>
       </fieldset>
+        </div>
+      </div>
     </template>
   </main>
 </template>
 
 <style scoped>
 :global(*) { box-sizing: border-box; }
-:global(body) { margin: 0; color: #e7edf7; background: #07111f; font-family: Inter, ui-sans-serif, system-ui; }
-main { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 48px 0; }
-header, .hero, .actions { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+:global(html) { scroll-behavior: smooth; }
+:global(body) { margin: 0; color: #f7f7fb; background: #0b0b18; font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif; }
+:global(body::before) { position: fixed; inset: 0; z-index: -1; content: ''; background: radial-gradient(circle at 58% -10%, #b6a8ff 0, #5d5682 25%, #17182b 56%, #080916 86%); }
+main { min-height: 100vh; padding: 40px; }
+.app-shell { display: grid; grid-template-columns: 248px minmax(0, 1fr); width: min(1480px, 100%); min-height: calc(100vh - 80px); margin: 0 auto; border: 1px solid #29293a; border-radius: 34px; background: #080910; box-shadow: 0 40px 120px #0009; }
+.sidebar { position: relative; display: flex; flex-direction: column; min-width: 0; padding: 30px 20px; border-right: 1px solid #282834; border-radius: 34px 0 0 34px; background: #06070d; }
+.brand { display: flex; align-items: center; gap: 12px; margin: 0 8px 42px; color: white; font-size: 1.15rem; font-weight: 750; text-decoration: none; letter-spacing: -.02em; }
+.brand-mark { display: grid; width: 36px; height: 36px; place-items: center; border-radius: 10px 4px 10px 4px; color: #080910; background: #b5a7ff; font-weight: 900; }
+.sidebar nav { display: grid; gap: 8px; }
+.sidebar nav a, .sidebar nav .nav-disabled { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid transparent; border-radius: 12px; color: #9595a3; font-size: .88rem; text-decoration: none; transition: .2s ease; }
+.sidebar nav a span, .sidebar nav .nav-disabled span { width: 22px; color: #c8c6d2; font-size: 1.1rem; text-align: center; }
+.sidebar nav a:hover, .sidebar nav a.active { border-color: #30303b; color: #fff; background: linear-gradient(90deg, #24242d, #15151c); }
+.sidebar nav .nav-disabled { opacity: .42; }
+.sidebar-note { display: flex; align-items: center; gap: 10px; margin-top: auto; padding: 14px; border: 1px solid #33323f; border-radius: 14px; background: radial-gradient(circle at 85% 10%, #8275d744, transparent 48%), #13131b; }
+.sidebar-note .safe-icon { display: grid; width: 32px; height: 32px; flex: 0 0 auto; place-items: center; border-radius: 10px; color: #080910; background: #b5a7ff; }
+.sidebar-note strong { margin: 0; font-size: .78rem; }
+.sidebar-note small { display: block; margin-top: 3px; color: #858592; font-size: .66rem; }
+.app-content { min-width: 0; padding: 30px 32px 42px; }
+.topbar, .topbar-actions, .hero, .actions { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+.topbar { min-height: 62px; }
+h1 { margin: 2px 0 0; font-size: clamp(1.8rem, 3vw, 2.4rem); letter-spacing: -.045em; }
+h2 { margin: 4px 0 18px; font-size: 1.35rem; letter-spacing: -.035em; }
+h3 { letter-spacing: -.02em; }
+p { color: #aaaab7; line-height: 1.55; }
+.eyebrow { margin: 0; color: #a99cf5; text-transform: uppercase; letter-spacing: .16em; font-size: .67rem; font-weight: 800; }
+.search-pill { min-width: 220px; padding: 11px 16px; border: 1px solid #353541; border-radius: 14px; color: #83838f; font-size: .78rem; text-decoration: none; }
+.search-pill span { float: right; color: #dddce6; font-size: 1.2rem; }
+.operator-dot { display: grid; width: 42px; height: 42px; place-items: center; border: 1px solid #b6a8ff; border-radius: 50%; color: #d9d2ff; background: #292537; font-size: .68rem; font-weight: 800; }
+.badge { padding: 8px 12px; border: 1px solid #474450; border-radius: 99px; color: #bcb8c9; font-size: .7rem; text-transform: uppercase; letter-spacing: .08em; }
 .action-lock { min-width: 0; margin: 0; padding: 0; border: 0; }
 .action-lock[disabled] { cursor: wait; }
 .action-lock[disabled] > *:not(.hero) { opacity: .72; }
-h1 { margin: 4px 0 0; font-size: clamp(2rem, 6vw, 4rem); letter-spacing: -.05em; }
-h2 { margin: 4px 0 16px; font-size: 2rem; }
-.eyebrow { color: #70e1bd; text-transform: uppercase; letter-spacing: .16em; font-size: .75rem; font-weight: 700; }
-.card { border: 1px solid #24364f; border-radius: 18px; padding: 28px; background: #0d1b2d; box-shadow: 0 18px 60px #0005; }
-.hero { margin-top: 42px; }
-.agent-activity { margin-top: 20px; }
+.card { min-width: 0; border: 1px solid #30303b; border-radius: 24px; padding: 24px; background: #111119; box-shadow: 0 16px 50px #0003; }
+.hero { position: relative; min-height: 250px; margin-top: 28px; overflow: hidden; padding: 38px 42px; background: radial-gradient(circle at 78% 35%, #4c3e7855 0 2%, transparent 2.5%), radial-gradient(circle at 82% 40%, transparent 0 13%, #77718424 13.3% 13.7%, transparent 14%), radial-gradient(circle at 82% 40%, transparent 0 25%, #7771841b 25.3% 25.7%, transparent 26%), linear-gradient(110deg, #181820 0%, #111119 58%, #191622 100%); }
+.hero::after { position: absolute; right: -60px; bottom: -150px; width: 470px; height: 330px; border: 1px solid #948da733; border-radius: 50%; content: ''; transform: rotate(-12deg); }
+.hero-copy { position: relative; z-index: 1; max-width: 580px; }
+.hero-copy h2 { margin: 12px 0; font-size: clamp(2rem, 4.2vw, 3.7rem); line-height: .98; }
+.hero-copy h2 span { color: #b5a7ff; }
+.hero-copy > p:last-child { max-width: 520px; margin-bottom: 0; }
+.run-control { position: relative; z-index: 1; min-width: 210px; padding: 22px; border: 1px solid #3b3948; border-radius: 18px; background: #0a0a10cc; backdrop-filter: blur(10px); }
+.run-control p { margin: 0; font-size: .75rem; }
+.run-control h3 { margin: 5px 0 18px; font-size: 1.25rem; }
+.run-control button { width: 100%; }
+.agent-activity { margin-top: 18px; background: linear-gradient(120deg, #13131b, #111119 65%, #1a1722); }
 .activity-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
 .activity-heading h2, .activity-heading p, .agent-activity > p { margin-bottom: 0; }
-.live-indicator { display: inline-flex; align-items: center; gap: 8px; color: #70e1bd; font-size: .75rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
-.live-dot { width: 9px; height: 9px; border-radius: 50%; background: #70e1bd; box-shadow: 0 0 0 5px #70e1bd20; }
+.agent-activity > strong { font-size: 1.35rem; }
+.live-indicator { display: inline-flex; align-items: center; gap: 8px; color: #58e0ae; font-size: .67rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+.live-dot { width: 8px; height: 8px; border-radius: 50%; background: #58e0ae; box-shadow: 0 0 0 5px #58e0ae18; }
 .spinner { display: inline-block; width: 1em; height: 1em; margin-right: 8px; vertical-align: -.15em; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 @keyframes spin { to { transform: rotate(360deg); } }
-.report-download { display: flex; align-items: center; gap: 20px; margin-top: 20px; }
+.report-download { display: flex; flex-wrap: wrap; align-items: center; gap: 20px; margin-top: 18px; }
 .report-download > div { flex: 1; }.report-download h2, .report-download p { margin: 0; }
 .report-download .success, .report-download .error { flex-basis: 100%; }
-.metrics, .settings, .workspace, .histories { margin-top: 20px; }
-.metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-.metrics article { min-width: 0; }
-.workspace, .history-grid { display: grid; grid-template-columns: 1fr 1.4fr; gap: 20px; }
-.pair { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; padding: 12px 0; border-bottom: 1px solid #24364f; }
-.pair strong { margin: 0; font-size: 1rem; }.pair small { grid-column: 1 / -1; color: #9eb0c8; }
-details { margin-top: 12px; } summary { cursor: pointer; font-weight: 700; } dl { display: grid; grid-template-columns: 1fr 1fr; font-size: .8rem; } dd { text-align: right; }
+.metrics, .settings, .workspace, .histories { margin-top: 18px; }
+.metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.metrics article { position: relative; min-height: 155px; overflow: hidden; padding: 22px; background: radial-gradient(circle at 92% 8%, #39e7ad18, transparent 34%), #111119; }
+.metrics article::after { position: absolute; right: -12%; bottom: -48%; width: 88%; height: 78%; border: 1px solid #48e8b855; border-radius: 50%; content: ''; transform: rotate(-9deg); }
+.metrics article:nth-child(2n)::after { border-color: #ff536e55; }
+.metrics article:nth-child(3n)::after { border-color: #ff9b4255; }
+.metrics article p { margin: 0; color: #bcbcc5; font-size: .78rem; }
+.metrics article strong { position: relative; z-index: 1; margin-top: 20px; font-size: clamp(1.15rem, 2.1vw, 1.7rem); }
+.metrics article small { position: relative; z-index: 1; display: block; margin-top: 8px; }
+.workspace, .history-grid { display: grid; grid-template-columns: minmax(250px, .85fr) minmax(0, 1.5fr); gap: 18px; }
+.pair { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; padding: 13px 0; border-bottom: 1px solid #292934; }
+.pair strong { margin: 0; font-size: .92rem; }.pair span { color: #b5a7ff; font-size: .8rem; }.pair small { grid-column: 1 / -1; color: #82828f; }
+details { margin-top: 12px; } summary { cursor: pointer; font-weight: 700; } dl { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; font-size: .8rem; } dd { margin-left: 12px; color: #bbb9c5; text-align: right; }
 .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }.charts h2 { grid-column: 1/-1; }
-.chart { border: 1px solid #24364f; border-radius: 12px; padding: 12px; min-height: 120px; }.chart h3 { margin: 0; text-transform: capitalize; }.chart svg { width: 100%; height: 70px; overflow: visible; }.chart polyline { fill: none; stroke: #70e1bd; stroke-width: 2; vector-effect: non-scaling-stroke; }
-.positive { color: #70e1bd; }.negative, .error { color: #ff6b82; }.neutral { color: #d5deea; }.profit small { display: block; font-weight: 800; }
-.filters { display: flex; gap: 12px; align-items: end; }.filters label { flex: 1; }.filters input, .filters select { display: block; width: 100%; margin-top: 6px; padding: 10px; color: white; border: 1px solid #3b506e; border-radius: 8px; background: #07111f; }
-.audit-list details { padding: 12px 0; border-bottom: 1px solid #24364f; }.audit-list pre, dd pre { max-width: 100%; margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }.pagination { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 14px; }.pagination button:disabled { cursor: not-allowed; opacity: .4; }.empty, .pagination { color: #9eb0c8; }
-.settings-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-bottom: 18px; }
+.chart { border: 1px solid #2c2c37; border-radius: 15px; padding: 14px; min-height: 125px; background: #0d0d14; }.chart h3 { margin: 0; color: #b7b7c2; font-size: .8rem; text-transform: capitalize; }.chart svg { width: 100%; height: 72px; overflow: visible; }.chart polyline { fill: none; stroke: #59e4b2; stroke-width: 2; filter: drop-shadow(0 0 5px #59e4b277); vector-effect: non-scaling-stroke; }
+.positive { color: #58e0ae; }.negative, .error { color: #ff667e; }.neutral { color: #d7d5df; }.profit small { display: block; font-weight: 800; }
+.filters { display: flex; gap: 12px; align-items: end; }.filters label { flex: 1; color: #b8b7c2; font-size: .78rem; }.filters input, .filters select { display: block; width: 100%; margin-top: 7px; padding: 11px; color: white; border: 1px solid #393945; border-radius: 10px; outline: none; background: #090910; }
+.filters input:focus, .filters select:focus, .settings input:focus, .access input:focus { border-color: #9f91f1; box-shadow: 0 0 0 3px #9f91f11a; }
+.audit-list details { padding: 14px 4px; border-bottom: 1px solid #292934; }.audit-list pre, dd pre { max-width: 100%; margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }.pagination { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 14px; }.pagination button:disabled { cursor: not-allowed; opacity: .4; }.empty, .pagination { color: #848491; }
+.settings-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 18px; }
 .settings label, .settings input { display: block; width: 100%; }
-.settings input, .access input { margin-top: 8px; border: 1px solid #3b506e; border-radius: 10px; padding: 12px; color: #fff; background: #07111f; }
-.success { margin-left: 14px; color: #70e1bd; }
-strong { display: block; margin-top: 8px; font-size: 1.8rem; }
-.badge { padding: 8px 12px; border: 1px solid #70e1bd; border-radius: 99px; color: #70e1bd; }
-button { border: 0; border-radius: 10px; padding: 12px 18px; background: #70e1bd; color: #06110d; font: inherit; font-weight: 800; cursor: pointer; }
-button:disabled { cursor: wait; opacity: .65; }
-button.secondary { color: #e7edf7; background: #24364f; }
-button.stop { color: #fff; background: #cf4c62; }
+.settings label { color: #b8b7c2; font-size: .78rem; }
+.settings input, .access input { margin-top: 8px; border: 1px solid #393945; border-radius: 10px; padding: 12px; color: #fff; outline: none; background: #090910; }
+.success { margin-left: 14px; color: #58e0ae; }
+strong { display: block; margin-top: 8px; font-size: 1.6rem; }
+button { border: 0; border-radius: 11px; padding: 12px 18px; color: #090811; background: #b5a7ff; font: inherit; font-size: .78rem; font-weight: 850; cursor: pointer; transition: transform .15s ease, filter .15s ease; }
+button:hover { filter: brightness(1.08); transform: translateY(-1px); }
+button:disabled { cursor: wait; opacity: .65; transform: none; }
+button.secondary { color: #eceaf4; background: #292934; }
+button.stop { color: #fff; background: #d84d66; }
 .access { max-width: 520px; margin: 6vh auto; }
 .access label, .access input { display: block; width: 100%; }
 .access label { margin: 28px 0 8px; }
 .access .actions { justify-content: flex-start; margin-top: 18px; }
-.error { color: #ff8799; }
-@media (max-width: 720px) { header, .hero, .report-download, .filters, .pagination { align-items: stretch; flex-direction: column; } .metrics, .workspace, .history-grid, .charts, .settings-grid { grid-template-columns: minmax(0, 1fr); } .charts h2 { grid-column: 1; } .card { min-width: 0; padding: 20px; } strong { overflow-wrap: anywhere; } }
+.incident-history { margin-top: 18px; }
+.error { color: #ff7a90; }
+@media (max-width: 1120px) { main { padding: 20px; } .app-shell { grid-template-columns: 82px minmax(0, 1fr); min-height: calc(100vh - 40px); } .sidebar { padding-inline: 14px; } .brand { justify-content: center; margin-inline: 0; } .brand > span:last-child, .sidebar nav a, .sidebar nav .nav-disabled { font-size: 0; } .sidebar nav a, .sidebar nav .nav-disabled { justify-content: center; padding-inline: 8px; } .sidebar nav a span, .sidebar nav .nav-disabled span { font-size: 1.15rem; } .sidebar-note { justify-content: center; padding: 10px; } .sidebar-note div { display: none; } .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .settings-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 760px) { main { padding: 0; } .app-shell { display: block; min-height: 100vh; border: 0; border-radius: 0; } .sidebar { position: sticky; top: 0; z-index: 10; display: flex; flex-direction: row; align-items: center; padding: 10px 14px; border-right: 0; border-bottom: 1px solid #292934; border-radius: 0; } .brand { margin: 0 12px 0 0; } .brand-mark { width: 32px; height: 32px; } .sidebar nav { display: flex; flex: 1; justify-content: space-around; } .sidebar nav a { padding: 8px; } .sidebar nav a span { width: auto; } .sidebar-note { display: none; } .app-content { padding: 22px 16px 36px; } .topbar, .hero, .report-download, .filters, .pagination { align-items: stretch; flex-direction: column; } .topbar-actions { justify-content: flex-start; flex-wrap: wrap; } .search-pill { display: none; } .hero { min-height: 0; padding: 28px 22px; } .hero-copy h2 { font-size: 2.35rem; } .run-control { width: 100%; } .metrics, .workspace, .history-grid, .charts, .settings-grid { grid-template-columns: minmax(0, 1fr); } .charts h2 { grid-column: 1; } .card { min-width: 0; padding: 20px; border-radius: 18px; } strong { overflow-wrap: anywhere; } .activity-heading { align-items: flex-start; flex-direction: column; } }
 </style>
