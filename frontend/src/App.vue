@@ -189,6 +189,8 @@ async function refreshDashboard() {
   } catch { /* retain last state */ }
 }
 
+const reloadPage = () => window.location.reload()
+
 async function authenticate(path: 'signup' | 'login') {
   error.value = ''
   try {
@@ -296,12 +298,17 @@ onUnmounted(() => { if (dashboardPoll !== undefined) window.clearInterval(dashbo
         <section class="card hero">
           <div class="hero-copy"><p class="eyebrow">{{ dashboard.product }}</p><h2>Trade the market.<br><span>Risk nothing real.</span></h2><p>Monitor your autonomous strategy, portfolio, and every persisted decision from one command center.</p></div>
           <div class="run-control"><p>Persisted run state</p><h3>{{ dashboard.operational_state === 'degraded' ? (isDatabaseContention() ? 'Paused — database contention' : 'Paused — market data degraded') : dashboard.operational_state === 'running' ? 'Running' : 'Stopped' }}</h3>
-          <button v-if="dashboard.desired_state === 'stopped'" @click="changeState('start')">
-            <span v-if="stateChanging === 'start'" class="spinner" aria-hidden="true" />{{ stateChanging === 'start' ? 'Starting agent…' : 'Start run' }}
-          </button>
-          <button v-else class="stop" @click="changeState('stop')">
-            <span v-if="stateChanging === 'stop'" class="spinner" aria-hidden="true" />{{ stateChanging === 'stop' ? 'Stopping agent…' : 'Stop run' }}
-          </button>
+          <div class="run-actions">
+            <button v-if="dashboard.desired_state === 'stopped'" type="button" @click="changeState('start')">
+              <span v-if="stateChanging === 'start'" class="spinner" aria-hidden="true" />{{ stateChanging === 'start' ? 'Starting agent…' : 'Start run' }}
+            </button>
+            <button v-else type="button" class="stop" @click="changeState('stop')">
+              <span v-if="stateChanging === 'stop'" class="spinner" aria-hidden="true" />{{ stateChanging === 'stop' ? 'Stopping agent…' : 'Stop run' }}
+            </button>
+            <button type="button" class="refresh-page" aria-label="Refresh page" @click="reloadPage">
+              <span aria-hidden="true">↻</span> Refresh
+            </button>
+          </div>
           </div>
         </section>
         <p v-if="stateChangeError" class="card error" role="alert">{{ stateChangeError }}</p>
@@ -495,6 +502,11 @@ p { color: #aaaab7; line-height: 1.55; }
 .run-control p { margin: 0; font-size: .75rem; }
 .run-control h3 { margin: 5px 0 18px; font-size: 1.25rem; }
 .run-control button { width: 100%; }
+.run-actions { display: flex; align-items: stretch; gap: 9px; }
+.run-actions > button:first-child { flex: 1; }
+.run-control .refresh-page { display: inline-flex; width: auto; align-items: center; justify-content: center; gap: 6px; padding-inline: 13px; border: 1px solid #444452; color: #e8e7ef; background: #25252f; }
+.refresh-page span { font-size: 1rem; transition: transform .2s ease; }
+.refresh-page:hover span { transform: rotate(45deg); }
 .agent-activity { margin-top: 18px; background: linear-gradient(120deg, #13131b, #111119 65%, #1a1722); }
 .activity-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
 .activity-heading h2, .activity-heading p, .agent-activity > p { margin-bottom: 0; }

@@ -145,6 +145,23 @@ test('operator signs up and starts then stops the paper-trading run', async () =
   await waitFor(() => expect(screen.getByText('Stopped')).toBeTruthy())
 })
 
+test('refresh page control is placed beside the start or stop action', async () => {
+  vi.spyOn(globalThis, 'fetch')
+    .mockImplementationOnce(() => jsonResponse({
+      product: 'Paper Trading Only', desired_state: 'stopped', operational_state: 'stopped',
+      engine_health: 'healthy', configured_capital_ntd: '5000', current_capital_ntd: '5000',
+      planning_failure: null, market_data_incident: null,
+    }))
+    .mockImplementationOnce(() => jsonResponse({ starting_capital_ntd: '5000' }))
+
+  render(App)
+  const startButton = await screen.findByRole('button', { name: 'Start run' })
+  const refreshButton = screen.getByRole('button', { name: 'Refresh page' })
+
+  expect(refreshButton.getAttribute('type')).toBe('button')
+  expect(refreshButton.parentElement).toBe(startButton.parentElement)
+})
+
 test('start shows progress, blocks every other action, and refreshes live agent activity', async () => {
   let resolveStart!: (response: Response) => void
   let resolveStop!: (response: Response) => void
