@@ -226,7 +226,10 @@ def test_engine_selects_five_markets_and_persists_an_immutable_auditable_plan(
         "ADAUSDT",
         "XRPUSDT",
     ]
-    assert all(selection.strategy_version in {"rsi-v1", "macd-v1"} for selection in plan.selections)
+    assert all(
+        selection.strategy_version in {"rsi-v1", "macd-v1", "bollinger-v1"}
+        for selection in plan.selections
+    )
     assert plan.frozen_settings["candle_interval"] == "1h"
     assert isinstance(plan.frozen_settings, RoundPlanningSettings)
 
@@ -252,8 +255,12 @@ def test_engine_selects_five_markets_and_persists_an_immutable_auditable_plan(
             "WHERE round_id = ?",
             (plan.round_id,),
         ).fetchall()
-        assert len(backtests) == 12
-        assert {row["strategy_version"] for row in backtests} == {"rsi-v1", "macd-v1"}
+        assert len(backtests) == 18
+        assert {row["strategy_version"] for row in backtests} == {
+            "rsi-v1",
+            "macd-v1",
+            "bollinger-v1",
+        }
         assert all('"indicator"' in row["assumptions_json"] for row in backtests)
         assert all('"trade_count"' in row["metrics_json"] for row in backtests)
         frozen = connection.execute(

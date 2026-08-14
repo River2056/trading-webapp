@@ -219,6 +219,34 @@ class MacdStrategy:
 
 
 @dataclass(frozen=True)
+class BollingerBandStrategy:
+    period: int = 20
+    standard_deviations: Decimal = Decimal("2")
+    version: str = "bollinger-v1"
+
+    @property
+    def configuration(self) -> dict[str, object]:
+        return {
+            "period": self.period,
+            "standard_deviations": self.standard_deviations,
+        }
+
+    def signals(self, candles: list[Candle]) -> list[int]:
+        closes = [candle.close for candle in candles]
+        signals = [0] * len(closes)
+        for index in range(self.period - 1, len(closes)):
+            window = closes[index - self.period + 1 : index + 1]
+            mean = sum(window, Decimal()) / self.period
+            variance = sum(((value - mean) ** 2 for value in window), Decimal()) / self.period
+            lower_band = mean - self.standard_deviations * variance.sqrt()
+            if closes[index] < lower_band:
+                signals[index] = 1
+            elif closes[index] > mean:
+                signals[index] = -1
+        return signals
+
+
+@dataclass(frozen=True)
 class Backtester:
     fee_pct: Decimal
     slippage_pct: Decimal
@@ -381,6 +409,11 @@ def _strategy_from_record(version: str, configuration_json: str) -> Strategy:
             fast_period=int(configuration["fast_period"]),
             slow_period=int(configuration["slow_period"]),
             signal_period=int(configuration["signal_period"]),
+        )
+    if version == "bollinger-v1":
+        return BollingerBandStrategy(
+            period=int(configuration["period"]),
+            standard_deviations=Decimal(str(configuration["standard_deviations"])),
         )
     raise RoundPlanningError(f"unsupported strategy version: {version}")
 
@@ -1262,7 +1295,7 @@ class TradingEngine:
         interval = settings.candle_interval
         lookback = settings.backtest_lookback_candles
         backtester = Backtester(settings.fee_pct, settings.slippage_pct)
-        strategies: list[Strategy] = [RsiStrategy(), MacdStrategy()]
+        strategies: list[Strategy] = [RsiStrategy(), MacdStrategy(), BollingerBandStrategy()]
         selections: list[Selection] = []
 
         qualified_candidates = 0
