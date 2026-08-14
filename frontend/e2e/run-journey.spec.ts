@@ -11,7 +11,7 @@ test('complete autonomous paper-trading release journey from clean reset', async
   await page.getByLabel('Password').fill(password)
   await page.getByRole('button', { name: 'Create local account' }).click()
   await expect(page.getByText('Paper Trading Only')).toBeVisible()
-  await expect(page.getByText('Stopped')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Stopped' })).toBeVisible()
 
   // Prove the account can log in, not only sign up.
   await context.clearCookies()
@@ -43,7 +43,7 @@ test('complete autonomous paper-trading release journey from clean reset', async
   await expect(page.getByRole('img', { name: /equity chart with 1 persisted/ })).toBeVisible()
 
   await page.getByRole('button', { name: 'Stop run' }).click()
-  await expect(page.getByText('Stopped')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Stopped' })).toBeVisible()
   await expect(page.getByText('No active pair selections.')).toBeVisible()
   await page.getByRole('button', { name: 'Start run' }).click()
   await expect(page.getByText('Running')).toBeVisible()
@@ -98,5 +98,5 @@ test('database contention is visibly distinct and actionable', async ({ page, re
   await page.reload()
   await expect(page.getByText('Paused — database contention')).toBeVisible()
   await expect(page.getByText('Database access is locked; execution will retry automatically.')).toBeVisible()
-  await expect(page.getByText('database is locked')).toBeVisible()
+  await expect(page.getByRole('alert').getByText('database is locked')).toBeVisible()
 })

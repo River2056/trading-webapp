@@ -559,6 +559,14 @@ def create_app(
                 "ORDER BY selection_rank",
                 (active_round["id"],),
             ).fetchall() if active_round else []
+            pending_transition = connection.execute(
+                "SELECT created_at FROM lifecycle_transitions WHERE status='pending_plan' "
+                "ORDER BY id LIMIT 1"
+            ).fetchone()
+            worker_checkpoint = connection.execute(
+                "SELECT outcome, last_attempt_at, last_success_at, updated_at "
+                "FROM worker_checkpoint WHERE id=1"
+            ).fetchone()
         active_incident = incident is not None and bool(incident["active"])
         health = "degraded" if failure or active_incident else "healthy"
         detail = incident["cause"] if active_incident else failure["reason"] if failure else None
@@ -582,6 +590,68 @@ def create_app(
         profit = current - cycle_initial
         profit_pct = profit / cycle_initial * 100 if cycle_initial else Decimal()
         direction = "positive" if profit > 0 else "negative" if profit < 0 else "neutral"
+        if row["desired_state"] == "stopped":
+            agent_activity = {
+                "status": "idle",
+                "title": "Agent stopped",
+                "detail": "Start the run to begin autonomous paper trading.",
+                "updated_at": latest_round["ended_at"] if latest_round else None,
+            }
+        elif failure:
+            agent_activity = {
+                "status": "attention",
+                "title": "Planning needs attention",
+                "detail": failure["reason"],
+                "updated_at": failure["occurred_at"],
+            }
+        elif active_incident:
+            agent_activity = {
+                "status": "waiting",
+                "title": "Waiting to retry market data",
+                "detail": incident["cause"],
+                "updated_at": incident["occurred_at"],
+            }
+        elif pending_transition:
+            agent_activity = {
+                "status": "planning",
+                "title": "Planning the next round",
+                "detail": "Ranking markets and validating strategy candidates.",
+                "updated_at": pending_transition["created_at"],
+            }
+        elif active_round:
+            worker_outcome = worker_checkpoint["outcome"] if worker_checkpoint else None
+            if worker_outcome in {None, "stopped", "idle"}:
+                agent_activity = {
+                    "status": "starting",
+                    "title": (
+                        "Resuming active round"
+                        if worker_outcome == "stopped"
+                        else "Starting round monitoring"
+                    ),
+                    "detail": "Waiting for the worker's first market evaluation.",
+                    "updated_at": (
+                        worker_checkpoint["updated_at"]
+                        if worker_checkpoint
+                        else latest_round["started_at"]
+                    ),
+                }
+            else:
+                agent_activity = {
+                    "status": "monitoring",
+                    "title": "Monitoring active round",
+                    "detail": (
+                        f"Watching {len(selections)} selected markets; last worker outcome: "
+                        f"{worker_outcome}."
+                    ),
+                    "updated_at": worker_checkpoint["updated_at"],
+                }
+        else:
+            agent_activity = {
+                "status": "starting",
+                "title": "Starting agent",
+                "detail": "Preparing the first round plan.",
+                "updated_at": None,
+            }
         return {
             "product": "Paper Trading Only",
             "desired_state": row["desired_state"],
@@ -640,6 +710,7 @@ def create_app(
                 if failure
                 else None
             ),
+            "agent_activity": agent_activity,
         }
 
     return app

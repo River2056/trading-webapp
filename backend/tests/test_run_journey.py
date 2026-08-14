@@ -77,8 +77,23 @@ def test_operator_can_configure_start_stop_and_observe_persisted_run(tmp_path: P
         assert projected["bankruptcy"] is None
         assert len(projected["selected_pairs"]) == 5
         assert projected["risk_settings"]["max_position_allocation_pct"] == "15.00"
+        assert projected["agent_activity"] == {
+            "status": "starting",
+            "title": "Starting round monitoring",
+            "detail": "Waiting for the worker's first market evaluation.",
+            "updated_at": "2026-01-08T12:00:00Z",
+        }
+
+        assert app.state.worker.step().outcome == "advanced"
+        activity = client.get("/api/dashboard").json()["agent_activity"]
+        assert activity["status"] == "monitoring"
+        assert activity["title"] == "Monitoring active round"
+        assert activity["detail"] == "Watching 5 selected markets; last worker outcome: advanced."
 
         assert client.post("/api/run/stop").json()["desired_state"] == "stopped"
+        stopped = client.get("/api/dashboard").json()
+        assert stopped["agent_activity"]["status"] == "idle"
+        assert stopped["agent_activity"]["title"] == "Agent stopped"
 
     with TestClient(
         create_app(database_path=database, market_data=FixtureMarketData())

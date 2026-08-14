@@ -137,8 +137,60 @@ test('operator signs up and starts then stops the paper-trading run', async () =
 
   await fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
   await screen.findByText('Running')
+  await waitFor(() => expect((document.querySelector('.action-lock') as HTMLFieldSetElement).disabled).toBe(false))
   await fireEvent.click(screen.getByRole('button', { name: 'Stop run' }))
   await waitFor(() => expect(screen.getByText('Stopped')).toBeTruthy())
+})
+
+test('start shows progress, blocks every other action, and refreshes live agent activity', async () => {
+  let resolveStart!: (response: Response) => void
+  let resolveStop!: (response: Response) => void
+  let running = false
+  const startResponse = new Promise<Response>((resolve) => { resolveStart = resolve })
+  const stopResponse = new Promise<Response>((resolve) => { resolveStop = resolve })
+  vi.spyOn(globalThis, 'fetch').mockImplementation((input, options) => {
+    const url = String(input)
+    if (url === '/api/run/start' && options?.method === 'POST') return startResponse
+    if (url === '/api/run/stop' && options?.method === 'POST') return stopResponse
+    if (url === '/api/dashboard') return jsonResponse({
+      product: 'Paper Trading Only', desired_state: running ? 'running' : 'stopped',
+      operational_state: running ? 'running' : 'stopped', engine_health: 'healthy',
+      configured_capital_ntd: '5000', current_capital_ntd: '5000', planning_failure: null,
+      market_data_incident: null, agent_activity: running
+        ? { status: 'monitoring', title: 'Monitoring active round',
+          detail: 'Watching 5 selected markets for the next strategy evaluation.', updated_at: 'now' }
+        : { status: 'idle', title: 'Agent stopped', detail: 'Start the run to begin trading.', updated_at: 'now' },
+    })
+    if (url === '/api/settings') return jsonResponse({ starting_capital_ntd: '5000' })
+    return jsonResponse({ items: [], total: 0, page: 1, page_size: 10, pages: 0 })
+  })
+
+  render(App)
+  expect(await screen.findByRole('heading', { name: 'Agent activity' })).toBeTruthy()
+  expect(screen.getByText('Agent stopped')).toBeTruthy()
+  await screen.findByRole('button', { name: 'Save settings' })
+
+  await fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+  expect((document.querySelector('.action-lock') as HTMLFieldSetElement).disabled).toBe(true)
+  expect(screen.getByRole('button', { name: 'Starting agent…' })).toBeTruthy()
+  expect(screen.getAllByText('Starting agent').length).toBeGreaterThanOrEqual(1)
+  expect(screen.getByText('Ranking markets and preparing the first active round.')).toBeTruthy()
+  expect(screen.getByRole('button', { name: 'Download Markdown run report' }).matches(':disabled')).toBe(true)
+  expect((document.querySelector('.settings button') as HTMLButtonElement).matches(':disabled')).toBe(true)
+  expect(screen.getByRole('status', { name: 'Run state change in progress' })).toBeTruthy()
+
+  running = true
+  resolveStart(await jsonResponse({ desired_state: 'running' }))
+  expect(await screen.findByText('Monitoring active round')).toBeTruthy()
+  expect((screen.getByRole('button', { name: 'Stop run' }) as HTMLButtonElement).disabled).toBe(false)
+
+  await fireEvent.click(screen.getByRole('button', { name: 'Stop run' }))
+  expect(screen.getByRole('button', { name: 'Stopping agent…' })).toBeTruthy()
+  expect(screen.getAllByText('Stopping agent').length).toBeGreaterThanOrEqual(1)
+  expect(screen.getByText('Persisting the stopped state and pausing new evaluations.')).toBeTruthy()
+  running = false
+  resolveStop(await jsonResponse({ desired_state: 'stopped' }))
+  expect(await screen.findByText('Agent stopped')).toBeTruthy()
 })
 
 test('degraded operational state is visibly paused with an execution alert', async () => {
