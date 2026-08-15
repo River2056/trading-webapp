@@ -311,6 +311,16 @@ onUnmounted(() => { if (dashboardPoll !== undefined) window.clearInterval(dashbo
           </div>
           </div>
         </section>
+        <section id="portfolio" class="metrics capital-grid">
+          <article class="card profit"><p>Total profit</p><strong :class="dashboard.profit_direction || 'neutral'">{{ money(dashboard.total_profit_ntd) }}</strong><small :class="dashboard.profit_direction || 'neutral'">{{ signedPct(dashboard.total_profit_pct) }}</small></article>
+          <article class="card"><p>Realized / unrealized</p><strong :class="Number(dashboard.realized_profit_ntd) > 0 ? 'positive' : Number(dashboard.realized_profit_ntd) < 0 ? 'negative' : 'neutral'">{{ money(dashboard.realized_profit_ntd) }}</strong><small :class="Number(dashboard.unrealized_profit_ntd) > 0 ? 'positive' : Number(dashboard.unrealized_profit_ntd) < 0 ? 'negative' : 'neutral'">{{ money(dashboard.unrealized_profit_ntd) }}</small></article>
+          <article class="card"><p>Initial capital</p><strong>{{ money(dashboard.initial_capital_ntd || dashboard.configured_capital_ntd) }}</strong></article>
+          <article class="card"><p>Current capital</p><strong>{{ money(dashboard.current_capital_ntd) }}</strong></article>
+          <article class="card"><p>Available capital</p><strong>{{ money(dashboard.available_capital_ntd || dashboard.current_capital_ntd) }}</strong></article>
+          <article class="card"><p>Current cycle</p><strong>{{ dashboard.current_cycle ? `#${dashboard.current_cycle.id}` : 'None' }}</strong><small>{{ money(dashboard.current_cycle_starting_capital_ntd) }} start · {{ dashboard.current_cycle?.started_at || 'not started' }}</small></article>
+          <article class="card"><p>Current round</p><strong>{{ dashboard.current_round ? `#${dashboard.current_round.id} · ${dashboard.current_round.status}` : 'None' }}</strong><small>{{ dashboard.completed_round_count || 0 }} completed · {{ dashboard.cycle_count || 0 }} total cycles</small></article>
+          <article class="card"><p>Bankruptcy</p><strong>{{ dashboard.days_since_bankruptcy == null ? 'Never' : `${dashboard.days_since_bankruptcy} days ago` }}</strong></article>
+        </section>
         <p v-if="stateChangeError" class="card error" role="alert">{{ stateChangeError }}</p>
         <section class="card agent-activity" aria-live="polite" aria-labelledby="agent-activity-heading">
           <div class="activity-heading">
@@ -320,17 +330,6 @@ onUnmounted(() => { if (dashboardPoll !== undefined) window.clearInterval(dashbo
           <strong>{{ activityTitle() }}</strong>
           <p>{{ activityDetail() }}</p>
           <small v-if="dashboard.agent_activity?.updated_at">Last update {{ dashboard.agent_activity.updated_at }}</small>
-        </section>
-        <section class="card report-download" aria-labelledby="run-report-heading">
-          <div>
-            <h2 id="run-report-heading">Run report</h2>
-            <p>Download the complete persisted paper-trading audit as Markdown.</p>
-          </div>
-          <button :disabled="reportDownloading" @click="downloadReport">
-            {{ reportDownloading ? 'Preparing Markdown report…' : 'Download Markdown run report' }}
-          </button>
-          <p v-if="reportStatus" role="status" class="success">{{ reportStatus }}</p>
-          <p v-if="reportError" role="alert" class="error">{{ reportError }}</p>
         </section>
         <section v-if="dashboard.engine_health === 'degraded'" class="card error" role="alert">
           <strong>Execution paused</strong>
@@ -355,16 +354,6 @@ onUnmounted(() => { if (dashboardPoll !== undefined) window.clearInterval(dashbo
           <p>{{ dashboard.bankruptcy.reason }}</p>
           <p>Ending equity NT${{ dashboard.bankruptcy.ending_equity_ntd }} · declared {{ dashboard.bankruptcy.declared_at }}</p>
           <p>Cycle {{ dashboard.cycle_count }} · {{ dashboard.days_since_bankruptcy }} days since bankruptcy</p>
-        </section>
-        <section id="portfolio" class="metrics capital-grid">
-          <article class="card"><p>Initial capital</p><strong>{{ money(dashboard.initial_capital_ntd || dashboard.configured_capital_ntd) }}</strong></article>
-          <article class="card"><p>Current capital</p><strong>{{ money(dashboard.current_capital_ntd) }}</strong></article>
-          <article class="card"><p>Available capital</p><strong>{{ money(dashboard.available_capital_ntd || dashboard.current_capital_ntd) }}</strong></article>
-          <article class="card profit"><p>Total profit</p><strong :class="dashboard.profit_direction || 'neutral'">{{ money(dashboard.total_profit_ntd) }}</strong><small :class="dashboard.profit_direction || 'neutral'">{{ signedPct(dashboard.total_profit_pct) }}</small></article>
-          <article class="card"><p>Realized / unrealized</p><strong :class="Number(dashboard.realized_profit_ntd) > 0 ? 'positive' : Number(dashboard.realized_profit_ntd) < 0 ? 'negative' : 'neutral'">{{ money(dashboard.realized_profit_ntd) }}</strong><small :class="Number(dashboard.unrealized_profit_ntd) > 0 ? 'positive' : Number(dashboard.unrealized_profit_ntd) < 0 ? 'negative' : 'neutral'">{{ money(dashboard.unrealized_profit_ntd) }}</small></article>
-          <article class="card"><p>Current cycle</p><strong>{{ dashboard.current_cycle ? `#${dashboard.current_cycle.id}` : 'None' }}</strong><small>{{ money(dashboard.current_cycle_starting_capital_ntd) }} start · {{ dashboard.current_cycle?.started_at || 'not started' }}</small></article>
-          <article class="card"><p>Current round</p><strong>{{ dashboard.current_round ? `#${dashboard.current_round.id} · ${dashboard.current_round.status}` : 'None' }}</strong><small>{{ dashboard.completed_round_count || 0 }} completed · {{ dashboard.cycle_count || 0 }} total cycles</small></article>
-          <article class="card"><p>Bankruptcy</p><strong>{{ dashboard.days_since_bankruptcy == null ? 'Never' : `${dashboard.days_since_bankruptcy} days ago` }}</strong></article>
         </section>
         <section class="workspace">
           <article id="strategies" class="card strategies">
@@ -449,6 +438,17 @@ onUnmounted(() => { if (dashboardPoll !== undefined) window.clearInterval(dashbo
           </div>
           <button @click="saveSettings">Save settings</button>
           <span class="success">{{ settingsMessage }}</span>
+        </section>
+        <section class="card report-download" aria-labelledby="run-report-heading">
+          <div>
+            <h2 id="run-report-heading">Run report</h2>
+            <p>Download the complete persisted paper-trading audit as Markdown.</p>
+          </div>
+          <button :disabled="reportDownloading" @click="downloadReport">
+            {{ reportDownloading ? 'Preparing Markdown report…' : 'Download Markdown run report' }}
+          </button>
+          <p v-if="reportStatus" role="status" class="success">{{ reportStatus }}</p>
+          <p v-if="reportError" role="alert" class="error">{{ reportError }}</p>
         </section>
       </fieldset>
         </div>

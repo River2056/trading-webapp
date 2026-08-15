@@ -162,6 +162,38 @@ test('refresh page control is placed beside the start or stop action', async () 
   expect(refreshButton.parentElement).toBe(startButton.parentElement)
 })
 
+test('portfolio follows run controls with profit first and report download last', async () => {
+  vi.spyOn(globalThis, 'fetch')
+    .mockImplementationOnce(() => jsonResponse({
+      product: 'Paper Trading Only', desired_state: 'stopped', operational_state: 'stopped',
+      engine_health: 'healthy', configured_capital_ntd: '5000', initial_capital_ntd: '5000',
+      current_capital_ntd: '5250', available_capital_ntd: '4700', realized_profit_ntd: '200',
+      unrealized_profit_ntd: '50', total_profit_ntd: '250', total_profit_pct: '5',
+      planning_failure: null, market_data_incident: null,
+    }))
+    .mockImplementationOnce(() => jsonResponse({ starting_capital_ntd: '5000' }))
+    .mockImplementationOnce(() => jsonResponse({ equity: [], profit: [], exposure: [], round_performance: [] }))
+    .mockImplementationOnce(() => jsonResponse({ items: [], total: 0, page: 1, page_size: 10, pages: 0 }))
+    .mockImplementationOnce(() => jsonResponse({ items: [], total: 0, page: 1, page_size: 10, pages: 0 }))
+    .mockImplementationOnce(() => jsonResponse({ items: [], total: 0, page: 1, page_size: 10, pages: 0 }))
+
+  render(App)
+  await screen.findByRole('button', { name: 'Start run' })
+
+  const layout = document.querySelector('.action-lock') as HTMLFieldSetElement
+  const sections = Array.from(layout.children)
+  expect(sections[0]?.classList.contains('hero')).toBe(true)
+  expect(sections[1]?.getAttribute('id')).toBe('portfolio')
+  expect(sections[sections.length - 1]?.classList.contains('report-download')).toBe(true)
+
+  const portfolioLabels = Array.from(document.querySelectorAll('#portfolio article > p'))
+    .map((element) => element.textContent)
+  expect(portfolioLabels).toEqual([
+    'Total profit', 'Realized / unrealized', 'Initial capital', 'Current capital',
+    'Available capital', 'Current cycle', 'Current round', 'Bankruptcy',
+  ])
+})
+
 test('start shows progress, blocks every other action, and refreshes live agent activity', async () => {
   let resolveStart!: (response: Response) => void
   let resolveStop!: (response: Response) => void
