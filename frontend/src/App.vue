@@ -74,7 +74,7 @@ const settingsMessage = ref('')
 const reportStatus = ref('')
 const reportError = ref('')
 const reportDownloading = ref(false)
-const stateChanging = ref<'start' | 'stop' | null>(null)
+const stateChanging = ref<'start' | 'stop' | 'fresh' | null>(null)
 const stateChangeError = ref('')
 let dashboardPoll: number | undefined
 let dashboardRevision = 0
@@ -100,11 +100,15 @@ const label = (value: string) => value.replace(/_/g, ' ')
 const isDatabaseContention = () => dashboard.value?.market_data_incident?.incident_kind === 'database_lock'
 const activityTitle = () => stateChanging.value === 'start'
   ? 'Starting agent'
+  : stateChanging.value === 'fresh'
+    ? 'Starting fresh round'
   : stateChanging.value === 'stop'
     ? 'Stopping agent'
     : dashboard.value?.agent_activity?.title || 'Activity unavailable'
 const activityDetail = () => stateChanging.value === 'start'
   ? 'Ranking markets and preparing the first active round.'
+  : stateChanging.value === 'fresh'
+    ? 'Finalizing the paused round, preserving its history, and preparing a new round.'
   : stateChanging.value === 'stop'
     ? 'Persisting the stopped state and pausing new evaluations.'
     : dashboard.value?.agent_activity?.detail || 'Waiting for the next agent update.'
@@ -201,17 +205,19 @@ async function authenticate(path: 'signup' | 'login') {
   }
 }
 
-async function changeState(state: 'start' | 'stop') {
+async function changeState(state: 'start' | 'stop' | 'fresh') {
   if (stateChanging.value) return
   dashboardRevision += 1
   stateChanging.value = state; stateChangeError.value = ''
   try {
-    await request(`/api/run/${state}`, { method: 'POST' })
+    await request(`/api/run/${state === 'fresh' ? 'fresh-round' : state}`, { method: 'POST' })
     dashboard.value = await request<Dashboard>('/api/dashboard')
     settings.value = await request<RunSettings>('/api/settings')
     if (dashboard.value.initial_capital_ntd !== undefined) await loadAnalytics()
   } catch {
-    stateChangeError.value = `Could not ${state} the agent.`
+    stateChangeError.value = state === 'fresh'
+      ? 'Could not start a fresh round.'
+      : `Could not ${state} the agent.`
     try { dashboard.value = await request<Dashboard>('/api/dashboard') } catch { /* retain last state */ }
   } finally {
     stateChanging.value = null
@@ -293,15 +299,20 @@ onUnmounted(() => { if (dashboardPoll !== undefined) window.clearInterval(dashbo
               <span class="operator-dot" aria-label="Local operator">LO</span>
             </div>
           </header>
-      <p v-if="stateChanging" class="sr-only" role="status" aria-label="Run state change in progress">{{ stateChanging === 'start' ? 'Starting agent' : 'Stopping agent' }}</p>
+      <p v-if="stateChanging" class="sr-only" role="status" aria-label="Run state change in progress">{{ stateChanging === 'start' ? 'Starting agent' : stateChanging === 'fresh' ? 'Starting fresh round' : 'Stopping agent' }}</p>
       <fieldset :disabled="stateChanging !== null" class="action-lock" :aria-busy="stateChanging !== null">
         <section class="card hero">
           <div class="hero-copy"><p class="eyebrow">{{ dashboard.product }}</p><h2>Trade the market.<br><span>Risk nothing real.</span></h2><p>Monitor your autonomous strategy, portfolio, and every persisted decision from one command center.</p></div>
           <div class="run-control"><p>Persisted run state</p><h3>{{ dashboard.operational_state === 'degraded' ? (isDatabaseContention() ? 'Paused — database contention' : 'Paused — market data degraded') : dashboard.operational_state === 'running' ? 'Running' : 'Stopped' }}</h3>
           <div class="run-actions">
-            <button v-if="dashboard.desired_state === 'stopped'" type="button" @click="changeState('start')">
-              <span v-if="stateChanging === 'start'" class="spinner" aria-hidden="true" />{{ stateChanging === 'start' ? 'Starting agent…' : 'Start run' }}
-            </button>
+            <template v-if="dashboard.desired_state === 'stopped'">
+              <button type="button" @click="changeState('start')">
+                <span v-if="stateChanging === 'start'" class="spinner" aria-hidden="true" />{{ stateChanging === 'start' ? 'Starting agent…' : 'Start run' }}
+              </button>
+              <button type="button" class="secondary" @click="changeState('fresh')">
+                <span v-if="stateChanging === 'fresh'" class="spinner" aria-hidden="true" />{{ stateChanging === 'fresh' ? 'Starting fresh round…' : 'Fresh round' }}
+              </button>
+            </template>
             <button v-else type="button" class="stop" @click="changeState('stop')">
               <span v-if="stateChanging === 'stop'" class="spinner" aria-hidden="true" />{{ stateChanging === 'stop' ? 'Stopping agent…' : 'Stop run' }}
             </button>

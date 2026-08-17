@@ -20,6 +20,7 @@ from pwdlib import PasswordHash
 
 from .database import Database, utc_now
 from .engine import RoundPlanningError, RoundPlanningSettings, TradingEngine
+from .lifecycle import RoundLifecycle
 from .market_data import BinanceMarketData, MarketData
 from .reporting import build_run_report
 from .schemas import PasswordInput, RunSettings
@@ -287,6 +288,18 @@ def create_app(
     def stop() -> dict[str, str]:
         with control_lock:
             return change_state(RunState.STOPPED)
+
+    @app.post("/api/run/fresh-round", dependencies=[Depends(authenticated)])
+    def fresh_round() -> dict[str, object]:
+        with control_lock:
+            with database.connect() as connection:
+                state = connection.execute(
+                    "SELECT desired_state FROM trading_run WHERE id=1"
+                ).fetchone()[0]
+            if state != "stopped":
+                raise HTTPException(status.HTTP_409_CONFLICT, "stop the run before starting fresh")
+            RoundLifecycle(database, engine.market_data, planning_clock).close_paused_round()
+            return start_serialized()
 
     @app.get("/api/analytics/charts", dependencies=[Depends(authenticated)])
     def analytics_charts() -> dict[str, list[dict[str, object]]]:

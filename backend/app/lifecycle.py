@@ -41,17 +41,37 @@ class RoundLifecycle:
     def close_due_round(
         self, connection: sqlite3.Connection | None = None
     ) -> RolloverResult | None:
+        return self._close_round(connection, require_running=True, require_due=True)
+
+    def close_paused_round(
+        self, connection: sqlite3.Connection | None = None
+    ) -> RolloverResult | None:
+        return self._close_round(
+            connection,
+            require_running=False,
+            require_due=False,
+            reason="fresh round requested",
+        )
+
+    def _close_round(
+        self,
+        connection: sqlite3.Connection | None,
+        *,
+        require_running: bool,
+        require_due: bool,
+        reason: str = "round completed",
+    ) -> RolloverResult | None:
         if connection is None:
             with self.database.connect() as owned:
                 owned.execute("BEGIN IMMEDIATE")
                 try:
-                    result = self._close(owned)
+                    result = self._close(owned, require_running, require_due, reason)
                     owned.commit()
                     return result
                 except BaseException:
                     owned.rollback()
                     raise
-        return self._close(connection)
+        return self._close(connection, require_running, require_due, reason)
 
     def _now(self) -> datetime:
         now = self.clock()
@@ -61,12 +81,18 @@ class RoundLifecycle:
     def _timestamp(now: datetime) -> str:
         return now.isoformat(timespec="seconds").replace("+00:00", "Z")
 
-    def _close(self, connection: sqlite3.Connection) -> RolloverResult | None:
+    def _close(
+        self,
+        connection: sqlite3.Connection,
+        require_running: bool,
+        require_due: bool,
+        reason: str,
+    ) -> RolloverResult | None:
         now = self._now()
         run = connection.execute(
             "SELECT desired_state FROM trading_run WHERE id=1"
         ).fetchone()
-        if run is None or run["desired_state"] != "running":
+        if run is None or (require_running and run["desired_state"] != "running"):
             return None
         row = connection.execute(
             "SELECT * FROM trading_round WHERE status='active' ORDER BY id DESC LIMIT 1"
@@ -78,7 +104,7 @@ class RoundLifecycle:
         if started.tzinfo is None:
             started = started.replace(tzinfo=UTC)
         duration = timedelta(days=int(settings.get("round_duration_days", 7)))
-        if now < started + duration:
+        if require_due and now < started + duration:
             return None
 
         round_id = int(row["id"])
@@ -127,8 +153,8 @@ class RoundLifecycle:
         connection.execute(
             "INSERT INTO lifecycle_transitions(cycle_id, completed_round_id, status, created_at, "
             "ending_equity_ntd, next_starting_capital_ntd, reason) "
-            "VALUES(?, ?, 'pending_plan', ?, ?, ?, 'round completed')",
-            (cycle_id, round_id, now.isoformat(), _text(ending), _text(ending)),
+            "VALUES(?, ?, 'pending_plan', ?, ?, ?, ?)",
+            (cycle_id, round_id, now.isoformat(), _text(ending), _text(ending), reason),
         )
         connection.execute(
             "UPDATE trading_run SET terminal_state=NULL, terminal_detail=NULL WHERE id=1"

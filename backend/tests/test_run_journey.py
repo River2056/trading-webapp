@@ -133,3 +133,45 @@ def test_start_reports_planning_failure_and_leaves_run_stopped(tmp_path: Path) -
         dashboard = client.get("/api/dashboard").json()
         assert dashboard["health"] == "healthy"
         assert dashboard["health_detail"] is None
+
+
+def test_fresh_round_completes_paused_round_and_starts_a_new_one(tmp_path: Path) -> None:
+    database = tmp_path / "fresh-round.sqlite3"
+    app = create_app(
+        database_path=database,
+        market_data=FixtureMarketData(),
+        clock=lambda: datetime(2026, 1, 8, 12, tzinfo=UTC),
+        start_worker=False,
+    )
+
+    with TestClient(app) as client:
+        client.post("/api/auth/signup", json={"password": "correct horse battery staple"})
+        first = client.post("/api/run/start")
+        assert first.status_code == 200
+        running_fresh = client.post("/api/run/fresh-round")
+        assert running_fresh.status_code == 409
+        assert running_fresh.json()["detail"] == "stop the run before starting fresh"
+        assert client.post("/api/run/stop").status_code == 200
+
+        fresh = client.post("/api/run/fresh-round")
+
+        assert fresh.status_code == 200
+        assert fresh.json()["desired_state"] == "running"
+        assert fresh.json()["round_id"] != first.json()["round_id"]
+        with sqlite3.connect(database) as connection:
+            connection.row_factory = sqlite3.Row
+            rounds = connection.execute(
+                "SELECT id, status, ended_at FROM trading_round ORDER BY id"
+            ).fetchall()
+            assert [row["status"] for row in rounds] == ["completed", "active"]
+            assert rounds[0]["ended_at"] is not None
+            assert connection.execute(
+                "SELECT COUNT(*) FROM round_retrospectives"
+            ).fetchone()[0] == 1
+            assert connection.execute(
+                "SELECT reason FROM lifecycle_transitions"
+            ).fetchone()[0] == "fresh round requested"
+
+        dashboard = client.get("/api/dashboard").json()
+        assert dashboard["completed_round_count"] == 1
+        assert dashboard["current_round"]["id"] == fresh.json()["round_id"]

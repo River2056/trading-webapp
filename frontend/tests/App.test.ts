@@ -162,6 +162,33 @@ test('refresh page control is placed beside the start or stop action', async () 
   expect(refreshButton.parentElement).toBe(startButton.parentElement)
 })
 
+test('fresh round is available while stopped and starts through its dedicated endpoint', async () => {
+  let running = false
+  const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((input, options) => {
+    const url = String(input)
+    if (url === '/api/run/fresh-round' && options?.method === 'POST') {
+      running = true
+      return jsonResponse({ desired_state: 'running', round_id: 2 })
+    }
+    if (url === '/api/dashboard') return jsonResponse({
+      product: 'Paper Trading Only', desired_state: running ? 'running' : 'stopped',
+      operational_state: running ? 'running' : 'stopped', engine_health: 'healthy',
+      configured_capital_ntd: '5000', current_capital_ntd: '5000', planning_failure: null,
+      market_data_incident: null,
+    })
+    if (url === '/api/settings') return jsonResponse({ starting_capital_ntd: '5000' })
+    return jsonResponse({ items: [], total: 0, page: 1, page_size: 10, pages: 0 })
+  })
+
+  render(App)
+  await fireEvent.click(await screen.findByRole('button', { name: 'Fresh round' }))
+
+  await screen.findByText('Running')
+  expect(fetchMock.mock.calls.some(([url, options]) =>
+    String(url) === '/api/run/fresh-round' && options?.method === 'POST')).toBe(true)
+  expect(screen.queryByRole('button', { name: 'Fresh round' })).toBeNull()
+})
+
 test('portfolio follows run controls with profit first and report download last', async () => {
   vi.spyOn(globalThis, 'fetch')
     .mockImplementationOnce(() => jsonResponse({
