@@ -38,6 +38,16 @@ def test_round_closes_at_persisted_duration_boundary_and_carries_equity(
     assert lifecycle.close_due_round() is None
 
 
+def test_paused_round_finalization_refuses_a_running_run(tmp_path: Path) -> None:
+    engine, database, data = active_engine(tmp_path)
+    lifecycle = RoundLifecycle(database, engine.market_data, lambda: data.now)
+
+    assert lifecycle.close_paused_round() is None
+    assert rows(database, "SELECT id, status FROM trading_round") == [
+        {"id": 1, "status": "active"}
+    ]
+
+
 def test_v5_migration_backfills_all_historical_rounds_into_one_active_cycle(
     tmp_path: Path,
 ) -> None:

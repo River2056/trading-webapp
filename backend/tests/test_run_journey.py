@@ -175,3 +175,37 @@ def test_fresh_round_completes_paused_round_and_starts_a_new_one(tmp_path: Path)
         dashboard = client.get("/api/dashboard").json()
         assert dashboard["completed_round_count"] == 1
         assert dashboard["current_round"]["id"] == fresh.json()["round_id"]
+
+
+def test_fresh_round_returns_retryable_error_without_finalizing_on_unsafe_data(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "unsafe-fresh-round.sqlite3"
+    market_data = FixtureMarketData()
+    app = create_app(
+        database_path=database,
+        market_data=market_data,
+        clock=lambda: datetime(2026, 1, 8, 12, tzinfo=UTC),
+        start_worker=False,
+    )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        client.post("/api/auth/signup", json={"password": "correct horse battery staple"})
+        assert client.post("/api/run/start").status_code == 200
+        assert client.post("/api/run/stop").status_code == 200
+        market_data.count = 0
+
+        fresh = client.post("/api/run/fresh-round")
+
+        assert fresh.status_code == 503
+        assert fresh.json()["detail"].startswith("fresh round finalization failed:")
+        dashboard = client.get("/api/dashboard").json()
+        assert dashboard["desired_state"] == "stopped"
+        assert dashboard["round_status"] == "active"
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM round_retrospectives"
+            ).fetchone() == (0,)
+            assert connection.execute(
+                "SELECT COUNT(*) FROM lifecycle_transitions"
+            ).fetchone() == (0,)

@@ -19,9 +19,9 @@ from fastapi import Cookie, Depends, FastAPI, HTTPException, Query, Response, st
 from pwdlib import PasswordHash
 
 from .database import Database, utc_now
-from .engine import RoundPlanningError, RoundPlanningSettings, TradingEngine
+from .engine import MarketDataSafetyError, RoundPlanningError, RoundPlanningSettings, TradingEngine
 from .lifecycle import RoundLifecycle
-from .market_data import BinanceMarketData, MarketData
+from .market_data import BinanceMarketData, MarketData, MarketDataError
 from .reporting import build_run_report
 from .schemas import PasswordInput, RunSettings
 from .worker import TradingWorker
@@ -293,12 +293,28 @@ def create_app(
     def fresh_round() -> dict[str, object]:
         with control_lock:
             with database.connect() as connection:
-                state = connection.execute(
-                    "SELECT desired_state FROM trading_run WHERE id=1"
-                ).fetchone()[0]
-            if state != "stopped":
-                raise HTTPException(status.HTTP_409_CONFLICT, "stop the run before starting fresh")
-            RoundLifecycle(database, engine.market_data, planning_clock).close_paused_round()
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    state = connection.execute(
+                        "SELECT desired_state FROM trading_run WHERE id=1"
+                    ).fetchone()[0]
+                    if state != "stopped":
+                        raise HTTPException(
+                            status.HTTP_409_CONFLICT, "stop the run before starting fresh"
+                        )
+                    RoundLifecycle(
+                        database, engine.market_data, planning_clock
+                    ).close_paused_round(connection)
+                    connection.commit()
+                except (MarketDataSafetyError, MarketDataError) as error:
+                    connection.rollback()
+                    raise HTTPException(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        f"fresh round finalization failed: {error}",
+                    ) from error
+                except BaseException:
+                    connection.rollback()
+                    raise
             return start_serialized()
 
     @app.get("/api/analytics/charts", dependencies=[Depends(authenticated)])

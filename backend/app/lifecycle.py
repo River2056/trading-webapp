@@ -41,14 +41,14 @@ class RoundLifecycle:
     def close_due_round(
         self, connection: sqlite3.Connection | None = None
     ) -> RolloverResult | None:
-        return self._close_round(connection, require_running=True, require_due=True)
+        return self._close_round(connection, expected_state="running", require_due=True)
 
     def close_paused_round(
         self, connection: sqlite3.Connection | None = None
     ) -> RolloverResult | None:
         return self._close_round(
             connection,
-            require_running=False,
+            expected_state="stopped",
             require_due=False,
             reason="fresh round requested",
         )
@@ -57,7 +57,7 @@ class RoundLifecycle:
         self,
         connection: sqlite3.Connection | None,
         *,
-        require_running: bool,
+        expected_state: str,
         require_due: bool,
         reason: str = "round completed",
     ) -> RolloverResult | None:
@@ -65,13 +65,13 @@ class RoundLifecycle:
             with self.database.connect() as owned:
                 owned.execute("BEGIN IMMEDIATE")
                 try:
-                    result = self._close(owned, require_running, require_due, reason)
+                    result = self._close(owned, expected_state, require_due, reason)
                     owned.commit()
                     return result
                 except BaseException:
                     owned.rollback()
                     raise
-        return self._close(connection, require_running, require_due, reason)
+        return self._close(connection, expected_state, require_due, reason)
 
     def _now(self) -> datetime:
         now = self.clock()
@@ -84,7 +84,7 @@ class RoundLifecycle:
     def _close(
         self,
         connection: sqlite3.Connection,
-        require_running: bool,
+        expected_state: str,
         require_due: bool,
         reason: str,
     ) -> RolloverResult | None:
@@ -92,7 +92,7 @@ class RoundLifecycle:
         run = connection.execute(
             "SELECT desired_state FROM trading_run WHERE id=1"
         ).fetchone()
-        if run is None or (require_running and run["desired_state"] != "running"):
+        if run is None or run["desired_state"] != expected_state:
             return None
         row = connection.execute(
             "SELECT * FROM trading_round WHERE status='active' ORDER BY id DESC LIMIT 1"
