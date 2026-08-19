@@ -104,6 +104,12 @@ elif [[ "$TAILSCALE_STATE" != "Running" ]]; then
   [[ "$TAILSCALE_STATE" == "Running" ]] || fail "Tailscale did not reach the Running state"
 fi
 
+TAILSCALE_DNS_NAME="$(
+  "$TAILSCALE_BIN" --socket="$TAILSCALE_SOCKET" status --json |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))'
+)"
+export VITE_ALLOWED_HOST="$TAILSCALE_DNS_NAME"
+
 log "Starting FastAPI on http://127.0.0.1:8000 ..."
 (
   cd "$ROOT_DIR"
@@ -122,7 +128,7 @@ wait_for_command "FastAPI" curl -fsS http://127.0.0.1:8000/openapi.json
 wait_for_command "Vite" curl -fsS http://127.0.0.1:5173/
 
 "$TAILSCALE_BIN" --socket="$TAILSCALE_SOCKET" serve --bg http://127.0.0.1:5173 >/dev/null
-TAILNET_URL="$($TAILSCALE_BIN --socket="$TAILSCALE_SOCKET" status --json | python3 -c 'import json,sys; print("https://" + json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
+TAILNET_URL="https://$TAILSCALE_DNS_NAME"
 
 log "Ready."
 log "Local URL:   http://127.0.0.1:5173"
