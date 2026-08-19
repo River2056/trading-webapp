@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -39,6 +40,13 @@ def test_analytics_are_authenticated_and_project_persisted_capital_rules_and_ser
     assert float(dashboard["total_profit_ntd"]) > 0
     assert float(dashboard["total_profit_pct"]) > 0
     assert dashboard["profit_direction"] == "positive"
+    assert float(dashboard["modeled_costs_ntd"]) > 0
+    assert float(dashboard["estimated_liquidation_equity_ntd"]) < float(
+        dashboard["current_capital_ntd"]
+    )
+    assert float(dashboard["estimated_liquidation_profit_ntd"]) < float(
+        dashboard["total_profit_ntd"]
+    )
     assert [pair["symbol"] for pair in dashboard["selected_pairs"]] == ["BTCUSDT", "ETHUSDT"]
     assert dashboard["selected_pairs"][0]["strategy_version"] == "rsi-v1"
     assert dashboard["risk_settings"]["max_concurrent_positions"] == 2
@@ -139,6 +147,58 @@ def test_dashboard_ignores_prior_cycle_snapshot_after_bankruptcy_reset(tmp_path:
     assert dashboard["available_capital_ntd"] == "5000.00"
     assert dashboard["current_cycle"]["id"] == new_cycle
     assert dashboard["current_cycle_starting_capital_ntd"] == "5000.00"
+
+
+def test_dashboard_estimates_net_liquidation_value_from_persisted_open_positions(
+    tmp_path: Path,
+) -> None:
+    client, engine, _database, _data = authenticated_client(tmp_path)
+
+    result = engine.evaluate_active_round()
+
+    dashboard = client.get("/api/dashboard").json()
+    expected_liquidation = result.account.cash_ntd + result.account.position_value_ntd * (
+        Decimal("1") - Decimal("0.20") / 100
+    ) * (Decimal("1") - Decimal("0.10") / 100)
+    assert dashboard["current_capital_ntd"] == f"{result.account.total_equity_ntd:.2f}"
+    assert dashboard["modeled_costs_ntd"] == f"{result.account.costs_ntd:.2f}"
+    assert dashboard["estimated_liquidation_equity_ntd"] == f"{expected_liquidation:.2f}"
+    assert dashboard["estimated_liquidation_profit_ntd"] == f"{expected_liquidation - 5000:.2f}"
+
+
+def test_dashboard_does_not_value_a_previous_round_snapshot_with_new_round_settings(
+    tmp_path: Path,
+) -> None:
+    client, engine, database, data = authenticated_client(tmp_path)
+    engine.evaluate_active_round()
+
+    with database.connect() as connection, connection:
+        old_round = connection.execute(
+            "SELECT id, cycle_id FROM trading_round WHERE status='active'"
+        ).fetchone()
+        connection.execute(
+            "UPDATE trading_round SET status='completed', ended_at=?, ending_equity_ntd='5100' "
+            "WHERE id=?",
+            (data.now.isoformat(), old_round["id"]),
+        )
+        new_settings = {
+            "starting_capital_ntd": "5100",
+            "fee_pct": "9",
+            "slippage_pct": "9",
+        }
+        new_round = connection.execute(
+            "INSERT INTO trading_round(status, started_at, frozen_settings_json, cycle_id) "
+            "VALUES('active', ?, ?, ?)",
+            (data.now.isoformat(), json.dumps(new_settings), old_round["cycle_id"]),
+        ).lastrowid
+        connection.execute("UPDATE trading_run SET current_capital_ntd='5100' WHERE id=1")
+
+    dashboard = client.get("/api/dashboard").json()
+    assert dashboard["current_round"]["id"] == new_round
+    assert dashboard["current_capital_ntd"] == "5100.00"
+    assert dashboard["modeled_costs_ntd"] == "0.00"
+    assert dashboard["estimated_liquidation_equity_ntd"] == "5100.00"
+    assert dashboard["estimated_liquidation_profit_ntd"] == "100.00"
 
 
 def test_profit_chart_uses_each_round_frozen_baseline_not_mutable_defaults(tmp_path: Path) -> None:

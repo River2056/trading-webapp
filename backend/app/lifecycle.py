@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from .database import Database
-from .engine import MarketDataSafetyError
+from .engine import MarketDataSafetyError, execution_fill
 from .market_data import MarketData, MarketDataError
 
 
@@ -289,8 +289,8 @@ class RoundLifecycle:
         evidence: dict[str, dict[str, object]],
         now: datetime,
     ) -> None:
-        fee_rate = Decimal(str(settings["fee_pct"])) / 100
-        slippage_rate = Decimal(str(settings["slippage_pct"])) / 100
+        fee_pct = Decimal(str(settings["fee_pct"]))
+        slippage_pct = Decimal(str(settings["slippage_pct"]))
         positions = connection.execute(
             "SELECT * FROM paper_positions WHERE round_id=? ORDER BY symbol", (round_id,)
         ).fetchall()
@@ -298,10 +298,11 @@ class RoundLifecycle:
             symbol = str(position["symbol"])
             quantity = Decimal(str(position["quantity"]))
             market = prices[symbol]
-            fill = market * (1 - slippage_rate)
-            notional = quantity * fill
-            fee = notional * fee_rate
-            slippage = quantity * (market - fill)
+            execution = execution_fill(quantity, market, "sell", fee_pct, slippage_pct)
+            fill = execution.fill_price_ntd
+            notional = execution.notional_ntd
+            fee = execution.fee_ntd
+            slippage = execution.slippage_ntd
             basis = quantity * Decimal(str(position["entry_price_ntd"]))
             realized = notional - fee - basis - Decimal(str(position["entry_cost_ntd"]))
             signal_id = hashlib.sha256(f"round-end:{round_id}:{symbol}".encode()).hexdigest()

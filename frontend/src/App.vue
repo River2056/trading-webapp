@@ -20,8 +20,11 @@ type Dashboard = {
   available_capital_ntd?: string
   realized_profit_ntd?: string
   unrealized_profit_ntd?: string
+  modeled_costs_ntd?: string
   total_profit_ntd?: string
   total_profit_pct?: string
+  estimated_liquidation_equity_ntd?: string
+  estimated_liquidation_profit_ntd?: string
   profit_direction?: 'positive' | 'negative' | 'neutral'
   selected_pairs?: Array<{ symbol: string; strategy_version: string; strategy_config: Record<string, unknown> }>
   risk_settings?: Record<string, unknown> | null
@@ -323,8 +326,11 @@ onUnmounted(() => { if (dashboardPoll !== undefined) window.clearInterval(dashbo
           </div>
         </section>
         <section id="portfolio" class="metrics capital-grid">
-          <article class="card profit"><p>Total profit</p><strong :class="dashboard.profit_direction || 'neutral'">{{ money(dashboard.total_profit_ntd) }}</strong><small :class="dashboard.profit_direction || 'neutral'">{{ signedPct(dashboard.total_profit_pct) }}</small></article>
+          <article class="card profit"><p>Current-cycle profit</p><strong :class="dashboard.profit_direction || 'neutral'">{{ money(dashboard.total_profit_ntd) }}</strong><small :class="dashboard.profit_direction || 'neutral'">{{ signedPct(dashboard.total_profit_pct) }}</small></article>
           <article class="card"><p>Realized / unrealized</p><strong :class="Number(dashboard.realized_profit_ntd) > 0 ? 'positive' : Number(dashboard.realized_profit_ntd) < 0 ? 'negative' : 'neutral'">{{ money(dashboard.realized_profit_ntd) }}</strong><small :class="Number(dashboard.unrealized_profit_ntd) > 0 ? 'positive' : Number(dashboard.unrealized_profit_ntd) < 0 ? 'negative' : 'neutral'">{{ money(dashboard.unrealized_profit_ntd) }}</small></article>
+          <article class="card"><p>Modeled costs</p><strong>{{ money(dashboard.modeled_costs_ntd) }}</strong><small>Fees + slippage incurred</small></article>
+          <article class="card"><p>Estimated liquidation equity</p><strong>{{ money(dashboard.estimated_liquidation_equity_ntd) }}</strong><small>After expected exit fees + slippage</small></article>
+          <article class="card"><p>Estimated liquidation profit</p><strong :class="Number(dashboard.estimated_liquidation_profit_ntd) > 0 ? 'positive' : Number(dashboard.estimated_liquidation_profit_ntd) < 0 ? 'negative' : 'neutral'">{{ money(dashboard.estimated_liquidation_profit_ntd) }}</strong><small>Current-cycle net liquidation basis</small></article>
           <article class="card"><p>Initial capital</p><strong>{{ money(dashboard.initial_capital_ntd || dashboard.configured_capital_ntd) }}</strong></article>
           <article class="card"><p>Current capital</p><strong>{{ money(dashboard.current_capital_ntd) }}</strong></article>
           <article class="card"><p>Available capital</p><strong>{{ money(dashboard.available_capital_ntd || dashboard.current_capital_ntd) }}</strong></article>

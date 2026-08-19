@@ -124,6 +124,35 @@ class BacktestResult:
         }
 
 
+@dataclass(frozen=True)
+class ExecutionFill:
+    fill_price_ntd: Decimal
+    notional_ntd: Decimal
+    fee_ntd: Decimal
+    slippage_ntd: Decimal
+
+
+def execution_fill(
+    quantity: Decimal,
+    market_price_ntd: Decimal,
+    side: str,
+    fee_pct: Decimal,
+    slippage_pct: Decimal,
+) -> ExecutionFill:
+    """Calculate the authoritative modeled fill price and itemized costs."""
+    if side not in {"buy", "sell"}:
+        raise ValueError("side must be buy or sell")
+    direction = Decimal("1") if side == "buy" else Decimal("-1")
+    fill_price = market_price_ntd * (Decimal("1") + direction * slippage_pct / 100)
+    notional = quantity * fill_price
+    return ExecutionFill(
+        fill_price_ntd=fill_price,
+        notional_ntd=notional,
+        fee_ntd=notional * fee_pct / 100,
+        slippage_ntd=quantity * abs(fill_price - market_price_ntd),
+    )
+
+
 class Strategy(Protocol):
     @property
     def version(self) -> str: ...
@@ -264,21 +293,28 @@ class Backtester:
             if signal == 1 and quantity == 0:
                 market_notional = cash / ((Decimal("1") + slippage) * (Decimal("1") + fee))
                 quantity = market_notional / candle.close
-                total_cost += market_notional * (slippage + fee)
+                fill = execution_fill(
+                    quantity, candle.close, "buy", self.fee_pct, self.slippage_pct
+                )
+                total_cost += fill.fee_ntd + fill.slippage_ntd
                 cash = Decimal()
                 fills += 1
                 entries += 1
             elif signal == -1 and quantity > 0:
-                market_notional = quantity * candle.close
-                total_cost += market_notional * (slippage + fee)
-                cash = market_notional * (Decimal("1") - slippage) * (Decimal("1") - fee)
+                fill = execution_fill(
+                    quantity, candle.close, "sell", self.fee_pct, self.slippage_pct
+                )
+                total_cost += fill.fee_ntd + fill.slippage_ntd
+                cash = fill.notional_ntd - fill.fee_ntd
                 quantity = Decimal()
                 fills += 1
                 exits += 1
         if quantity > 0:
-            market_notional = quantity * candles[-1].close
-            total_cost += market_notional * (slippage + fee)
-            cash = market_notional * (Decimal("1") - slippage) * (Decimal("1") - fee)
+            fill = execution_fill(
+                quantity, candles[-1].close, "sell", self.fee_pct, self.slippage_pct
+            )
+            total_cost += fill.fee_ntd + fill.slippage_ntd
+            cash = fill.notional_ntd - fill.fee_ntd
             fills += 1
             exits += 1
         return BacktestResult(
@@ -999,10 +1035,9 @@ class TradingEngine:
         current_prices: dict[str, Decimal],
         sizing_account: PortfolioAccount,
     ) -> None:
-        fee_rate = Decimal(str(settings["fee_pct"])) / 100
-        slippage_rate = Decimal(str(settings["slippage_pct"])) / 100
+        fee_pct = Decimal(str(settings["fee_pct"]))
+        slippage_pct = Decimal(str(settings["slippage_pct"]))
         if side == "buy":
-            fill_price = market_price_ntd * (1 + slippage_rate)
             quantity = self._buy_quantity(
                 connection,
                 round_id,
@@ -1012,9 +1047,11 @@ class TradingEngine:
                 current_prices,
                 sizing_account,
             )
-            notional = quantity * fill_price
-            fee = notional * fee_rate
-            slippage = quantity * (fill_price - market_price_ntd)
+            fill = execution_fill(quantity, market_price_ntd, side, fee_pct, slippage_pct)
+            fill_price = fill.fill_price_ntd
+            notional = fill.notional_ntd
+            fee = fill.fee_ntd
+            slippage = fill.slippage_ntd
             realized = Decimal()
             connection.execute(
                 "INSERT INTO paper_positions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1034,10 +1071,11 @@ class TradingEngine:
                 "SELECT * FROM paper_positions WHERE round_id=? AND symbol=?", (round_id, symbol)
             ).fetchone()
             quantity = Decimal(str(position["quantity"]))
-            fill_price = market_price_ntd * (1 - slippage_rate)
-            notional = quantity * fill_price
-            fee = notional * fee_rate
-            slippage = quantity * (market_price_ntd - fill_price)
+            fill = execution_fill(quantity, market_price_ntd, side, fee_pct, slippage_pct)
+            fill_price = fill.fill_price_ntd
+            notional = fill.notional_ntd
+            fee = fill.fee_ntd
+            slippage = fill.slippage_ntd
             basis = quantity * Decimal(str(position["entry_price_ntd"]))
             realized = notional - fee - basis - Decimal(str(position["entry_cost_ntd"]))
             connection.execute(

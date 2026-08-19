@@ -574,7 +574,7 @@ def create_app(
             ).fetchone()
             latest_snapshot = connection.execute(
                 "SELECT ps.* FROM portfolio_snapshots ps JOIN trading_round tr "
-                "ON tr.id=ps.round_id WHERE tr.cycle_id=? "
+                "ON tr.id=ps.round_id WHERE tr.cycle_id=? AND tr.status='active' "
                 "ORDER BY ps.valued_at DESC, ps.id DESC LIMIT 1",
                 (current_cycle["id"],),
             ).fetchone() if current_cycle else None
@@ -616,9 +616,24 @@ def create_app(
         available = Decimal(str(available_value))
         realized = Decimal(str(latest_snapshot["realized_pnl_ntd"] if latest_snapshot else "0"))
         unrealized = Decimal(str(latest_snapshot["unrealized_pnl_ntd"] if latest_snapshot else "0"))
+        modeled_costs = Decimal(str(latest_snapshot["costs_ntd"] if latest_snapshot else "0"))
         profit = current - cycle_initial
         profit_pct = profit / cycle_initial * 100 if cycle_initial else Decimal()
         direction = "positive" if profit > 0 else "negative" if profit < 0 else "neutral"
+        active_settings = (
+            json.loads(str(active_round["frozen_settings_json"])) if active_round else {}
+        )
+        fee_rate = Decimal(str(active_settings.get("fee_pct", "0"))) / 100
+        slippage_rate = Decimal(str(active_settings.get("slippage_pct", "0"))) / 100
+        liquidation_equity = (
+            Decimal(str(latest_snapshot["cash_ntd"]))
+            + Decimal(str(latest_snapshot["position_value_ntd"]))
+            * (Decimal("1") - slippage_rate)
+            * (Decimal("1") - fee_rate)
+            if latest_snapshot
+            else current
+        )
+        liquidation_profit = liquidation_equity - cycle_initial
         if row["desired_state"] == "stopped":
             agent_activity = {
                 "status": "idle",
@@ -692,8 +707,11 @@ def create_app(
             "available_capital_ntd": f"{available:.2f}",
             "realized_profit_ntd": f"{realized:.2f}",
             "unrealized_profit_ntd": f"{unrealized:.2f}",
+            "modeled_costs_ntd": f"{modeled_costs:.2f}",
             "total_profit_ntd": f"{profit:.2f}",
             "total_profit_pct": f"{profit_pct:.2f}",
+            "estimated_liquidation_equity_ntd": f"{liquidation_equity:.2f}",
+            "estimated_liquidation_profit_ntd": f"{liquidation_profit:.2f}",
             "profit_direction": direction,
             "selected_pairs": [
                 {

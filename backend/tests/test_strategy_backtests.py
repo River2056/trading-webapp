@@ -1,8 +1,24 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from backend.app.engine import Backtester, BollingerBandStrategy, MacdStrategy, RsiStrategy
+import pytest
+
+from backend.app.engine import (
+    Backtester,
+    BollingerBandStrategy,
+    MacdStrategy,
+    RsiStrategy,
+    execution_fill,
+)
 from backend.app.market_data import Candle
+
+
+class BuyAndHoldStrategy:
+    version = "buy-and-hold-test"
+    configuration: dict[str, object] = {}
+
+    def signals(self, values: list[Candle]) -> list[int]:
+        return [1] + [0] * (len(values) - 1)
 
 
 def candles(closes: list[int]) -> list[Candle]:
@@ -71,3 +87,16 @@ def test_no_signal_backtest_has_no_fake_buy_and_hold_return() -> None:
         assert result.trade_count == 0
         assert result.net_return_pct == 0
         assert not result.qualified
+
+
+def test_backtest_disclosed_cost_matches_itemized_fill_costs() -> None:
+    result = Backtester(Decimal("1"), Decimal("1")).run(
+        BuyAndHoldStrategy(), candles([100] * 29 + [110])
+    )
+
+    assert result.total_cost_pct == Decimal("4.116263111459660817566905206")
+
+
+def test_execution_fill_rejects_unknown_sides() -> None:
+    with pytest.raises(ValueError, match="side must be buy or sell"):
+        execution_fill(Decimal("1"), Decimal("100"), "short", Decimal("1"), Decimal("1"))

@@ -18,6 +18,8 @@ test('analytical dashboard shows signed profit, persisted charts, strategies and
       engine_health: 'healthy', initial_capital_ntd: '5000.00', configured_capital_ntd: '5000.00',
       current_capital_ntd: '5250.00', available_capital_ntd: '4700.00', realized_profit_ntd: '200.00',
       unrealized_profit_ntd: '50.00', total_profit_ntd: '250.00', total_profit_pct: '5.00',
+      modeled_costs_ntd: '12.50', estimated_liquidation_equity_ntd: '5235.00',
+      estimated_liquidation_profit_ntd: '235.00',
       profit_direction: 'positive', cycle_count: 2, completed_round_count: 3, days_since_bankruptcy: 9,
       round_status: 'active', planning_failure: null, market_data_incident: null,
       selected_pairs: [{ symbol: 'BTCUSDT', strategy_version: 'rsi-v1',
@@ -38,6 +40,14 @@ test('analytical dashboard shows signed profit, persisted charts, strategies and
   expect(screen.getByRole('link', { name: 'Portfolio' })).toBeTruthy()
   expect(await screen.findByText('NT$250.00')).toBeTruthy()
   expect(screen.getByText('+5.00%')).toBeTruthy()
+  expect(screen.getByText('Current-cycle profit')).toBeTruthy()
+  expect(screen.queryByText('Total profit')).toBeNull()
+  expect(screen.getByText('Estimated liquidation equity')).toBeTruthy()
+  expect(screen.getByText('NT$5,235.00')).toBeTruthy()
+  expect(screen.getByText('Estimated liquidation profit')).toBeTruthy()
+  expect(screen.getByText('NT$235.00')).toBeTruthy()
+  expect(screen.getByText('Modeled costs')).toBeTruthy()
+  expect(screen.getByText('NT$12.50')).toBeTruthy()
   expect(screen.getByText('BTCUSDT')).toBeTruthy()
   expect(screen.getByText('rsi-v1')).toBeTruthy()
   expect(await screen.findByRole('img', { name: 'equity chart with 1 persisted observations' })).toBeTruthy()
@@ -216,8 +226,9 @@ test('portfolio follows run controls with profit first and report download last'
   const portfolioLabels = Array.from(document.querySelectorAll('#portfolio article > p'))
     .map((element) => element.textContent)
   expect(portfolioLabels).toEqual([
-    'Total profit', 'Realized / unrealized', 'Initial capital', 'Current capital',
-    'Available capital', 'Current cycle', 'Current round', 'Bankruptcy',
+    'Current-cycle profit', 'Realized / unrealized', 'Modeled costs',
+    'Estimated liquidation equity', 'Estimated liquidation profit', 'Initial capital',
+    'Current capital', 'Available capital', 'Current cycle', 'Current round', 'Bankruptcy',
   ])
 })
 
